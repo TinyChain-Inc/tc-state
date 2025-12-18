@@ -1,0 +1,19 @@
+[package]
+name = "tc-state"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+async-trait = "0.1"
+destream = "0.8"
+ha-ndarray = "0.4"
+number-general = { version = "0.12", default-features = false, features = ["stream"] }
+pathlink = "0.3"
+safecast = "0.2"
+tc-ir = { path = "../tc-ir" }
+tc-value = { path = "../tc-value" }
+
+[dev-dependencies]
+bytes = "1"
+destream_json = { version = "0.13", default-features = false }
+futures = "0.3"
