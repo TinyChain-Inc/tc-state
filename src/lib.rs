@@ -410,6 +410,9 @@ impl<'en> en::IntoStream<'en> for State {
         match self {
             State::None => encoder.encode_unit(),
             State::Scalar(Scalar::Value(value)) => value.into_stream(encoder),
+            State::Scalar(Scalar::Ref(_)) => Err(E::Error::custom(
+                "cannot serialize Scalar::Ref as State until TCRef encoding is implemented",
+            )),
             State::Collection(collection) => collection.into_stream(encoder),
         }
     }
