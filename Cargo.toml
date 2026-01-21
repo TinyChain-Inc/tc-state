@@ -17,3 +17,7 @@ tc-value = { path = "../tc-value" }
 bytes = "1"
 destream_json = { version = "0.13", default-features = false }
 futures = "0.3"
+
+[patch.crates-io]
+destream = { path = "../deps/destream" }
+destream_json = { path = "../deps/destream_json" }
