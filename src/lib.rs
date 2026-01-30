@@ -8,7 +8,6 @@
 
 use std::{any::Any, convert::TryFrom, sync::Arc};
 
-use async_trait::async_trait;
 use destream::{
     de,
     en::{self, EncodeMap, EncodeSeq, Error as _},
@@ -189,7 +188,6 @@ impl<'en> en::ToStream<'en> for Tensor {
     }
 }
 
-#[async_trait]
 impl de::FromStream for Tensor {
     type Context = StateContext;
 
@@ -199,7 +197,6 @@ impl de::FromStream for Tensor {
     ) -> Result<Self, D::Error> {
         struct TensorVisitor;
 
-        #[async_trait]
         impl de::Visitor for TensorVisitor {
             type Value = Tensor;
 
@@ -311,7 +308,6 @@ impl From<Collection> for State {
     }
 }
 
-#[async_trait]
 impl de::FromStream for State {
     type Context = StateContext;
 
@@ -323,7 +319,6 @@ impl de::FromStream for State {
             context: StateContext,
         }
 
-        #[async_trait]
         impl de::Visitor for StateVisitor {
             type Value = State;
 

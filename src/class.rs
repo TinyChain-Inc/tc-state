@@ -96,7 +96,7 @@ impl NativeClass for TensorType {
 }
 
 fn path_matches(path: &[PathSegment], expected: &PathLabel) -> bool {
-    path.len() == expected.len()
+    path.len() == expected[..].len()
         && path
             .iter()
             .enumerate()
