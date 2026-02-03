@@ -67,7 +67,7 @@ The `ROADMAP.md` phases introduce chunked storage and temporal cursor APIs for
   custody events must be emitted whenever media state changes, aligning with the
   control-plane roadmap.
 
-Client helpers (`client/py`, `client/js`) will call into these APIs once the
+Client libraries (Python, Node.js, WASM) will call into these APIs once the
 chunk manager stabilizes.
 
 ## PII-aware retention defaults

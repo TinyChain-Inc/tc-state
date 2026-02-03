@@ -6,11 +6,10 @@ layout and serialization contracts so every adapter can hydrate the same tree.
 
 ## Before you start
 
-- Read the workspace `ARCHITECTURE.md`, `ROADMAP.md`, and this crate’s
-  `README.md`/`AGENTS.md` to understand the current scope (control-plane
-  bootstrap, media experiments, retention defaults).
-- Follow the repo-wide `CODE_STYLE.md`: grouped imports, rustfmt, and clippy
-  cleanliness apply here.
+- Read this crate’s `README.md`, `ROADMAP.md`, and `AGENTS.md` to understand the
+  current scope (bootstrap, media experiments, retention defaults).
+- Keep formatting and linting clean: run `cargo fmt` and
+  `cargo clippy --all-targets --all-features -D warnings`.
 
 ## Development checklist
 
@@ -28,7 +27,7 @@ layout and serialization contracts so every adapter can hydrate the same tree.
    - Add focused unit tests for new media chunks, retention policies, or
      bootstrap loaders.
 5. **Docs.** Reflect behavioral changes in `README.md`, `AGENTS.md`, and any
-   relevant workspace doc. Call out migration steps (e.g., required txfs
+   relevant docs. Call out migration steps (e.g., required txfs
    migrations) so hosts can upgrade safely.
 6. **No fallback flows.** Remove legacy pathways instead of adding new ones; the
    crate should model the single canonical state layout.
@@ -44,8 +43,7 @@ layout and serialization contracts so every adapter can hydrate the same tree.
 ## Rights and licensing
 
 By contributing to this crate you represent that (a) you authored the work (or
-otherwise have the rights to contribute it) and (b) you transfer and assign all
-right, title, and interest in the contribution to the TinyChain Open-Source
-Project for distribution under the TinyChain open-source license (Apache 2.0,
-see the root `LICENSE`). Contributions must be free of third-party claims or
-encumbrances.
+otherwise have the rights to contribute it), (b) the contribution is unencumbered
+by third-party intellectual property claims, and (c) you transfer and assign all
+right, title, and interest in the contribution to The TinyChain Contributors for
+distribution under the Apache 2.0 license (see `LICENSE`).
