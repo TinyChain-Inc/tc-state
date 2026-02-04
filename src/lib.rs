@@ -6,7 +6,7 @@
 //! representation keeps downstream crates unblocked while we finish the shared
 //! persistence layer.
 
-use std::{any::Any, convert::TryFrom, sync::Arc};
+use std::{convert::TryFrom, str::FromStr, sync::Arc};
 
 use destream::{
     de,
@@ -17,7 +17,8 @@ use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead};
 use number_general::{FloatType, Number, UIntType};
 use pathlink::PathBuf;
 use safecast::{CastInto, TryCastFrom};
-use tc_ir::Scalar;
+use pathlink::Link;
+use tc_ir::{Claim, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::{number_type_from_path, number_type_path, NumberType, Value, ValueType};
 
 mod class;
@@ -189,7 +190,7 @@ impl<'en> en::ToStream<'en> for Tensor {
 }
 
 impl de::FromStream for Tensor {
-    type Context = StateContext;
+    type Context = Arc<dyn Transaction>;
 
     async fn from_stream<D: de::Decoder>(
         _context: Self::Context,
@@ -237,40 +238,40 @@ impl de::FromStream for Tensor {
     }
 }
 
-/// Opaque context handle forwarded to state deserializers.
 #[derive(Clone)]
-pub struct StateContext {
-    inner: Arc<dyn Any + Send + Sync>,
+struct NullTransaction {
+    id: TxnId,
+    claim: Claim,
 }
 
-impl StateContext {
-    /// Returns a new context handle containing no additional metadata.
-    pub fn empty() -> Self {
-        Self::default()
-    }
-
-    /// Attempts to borrow the context as the requested type.
-    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
-        self.inner.as_ref().downcast_ref::<T>()
-    }
-
-    /// Stores typed context data alongside this handle.
-    pub fn with_data<T>(data: T) -> Self
-    where
-        T: Any + Send + Sync + 'static,
-    {
-        Self {
-            inner: Arc::new(data),
-        }
-    }
-}
-
-impl Default for StateContext {
+impl Default for NullTransaction {
     fn default() -> Self {
-        Self {
-            inner: Arc::new(()),
-        }
+        let id = TxnId::from_parts(NetworkTime::from_nanos(0), 0);
+        let claim = Claim::new(
+            Link::from_str("/lib/default").expect("default claim link"),
+            umask::Mode::all(),
+        );
+        Self { id, claim }
     }
+}
+
+impl Transaction for NullTransaction {
+    fn id(&self) -> TxnId {
+        self.id
+    }
+
+    fn timestamp(&self) -> NetworkTime {
+        self.id.timestamp()
+    }
+
+    fn claim(&self) -> &Claim {
+        &self.claim
+    }
+}
+
+/// Return a placeholder transaction context for decoding state without a transaction.
+pub fn null_transaction() -> Arc<dyn Transaction> {
+    Arc::new(NullTransaction::default())
 }
 
 /// Transitional TinyChain state enum.
@@ -309,14 +310,14 @@ impl From<Collection> for State {
 }
 
 impl de::FromStream for State {
-    type Context = StateContext;
+    type Context = Arc<dyn Transaction>;
 
     async fn from_stream<D: de::Decoder>(
         context: Self::Context,
         decoder: &mut D,
     ) -> Result<Self, D::Error> {
         struct StateVisitor {
-            context: StateContext,
+            context: Arc<dyn Transaction>,
         }
 
         impl de::Visitor for StateVisitor {
@@ -560,15 +561,9 @@ mod tests {
     }
 
     #[test]
-    fn state_context_downcasts() {
-        let ctx = StateContext::with_data(String::from("hello"));
-        assert!(ctx.downcast_ref::<String>().is_some());
-    }
-
-    #[test]
     fn scalar_numbers_round_trip() {
         let encoded = encode_json(true);
-        let state: State = decode_json(StateContext::empty(), encoded);
+        let state: State = decode_json(null_transaction(), encoded);
         assert!(matches!(
             state,
             State::Scalar(Scalar::Value(Value::Number(_)))
@@ -583,7 +578,7 @@ mod tests {
         let state = State::Collection(Collection::from(tensor));
 
         let encoded = encode_json(state.clone());
-        let decoded: State = decode_json(StateContext::empty(), encoded);
+        let decoded: State = decode_json(null_transaction(), encoded);
 
         match decoded {
             State::Collection(Collection::Tensor(Tensor::F32(buf))) => {
@@ -597,7 +592,7 @@ mod tests {
     fn tensor_direct_round_trip() {
         let tensor = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("dense tensor");
         let bytes = encode_json(tensor.clone());
-        let decoded: Tensor = decode_json(StateContext::empty(), bytes);
+        let decoded: Tensor = decode_json(null_transaction(), bytes);
         match decoded {
             Tensor::F32(buf) => assert_eq!(buf.size(), 4),
             other => panic!("unexpected tensor variant {other:?}"),

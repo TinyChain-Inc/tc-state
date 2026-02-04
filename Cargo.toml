@@ -12,6 +12,7 @@ pathlink = "0.4"
 safecast = "0.2"
 tc-ir = { path = "../tc-ir" }
 tc-value = { path = "../tc-value" }
+umask = "2.1"
 
 [dev-dependencies]
 bytes = "1"
