@@ -18,13 +18,15 @@ use number_general::{FloatType, Number, UIntType};
 use pathlink::PathBuf;
 use safecast::{CastInto, TryCastFrom};
 use pathlink::Link;
-use tc_ir::{Claim, NetworkTime, Scalar, Transaction, TxnId};
+use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::{number_type_from_path, number_type_path, NumberType, Value, ValueType};
 
 mod class;
 
 pub use class::{CollectionType, StateType, TensorType};
 pub use tc_ir::{Class, NativeClass};
+
+const STATE_SCALAR_MAP_PATH: &str = "/state/scalar/map";
 
 /// Temporary tensor representation (in-memory only).
 #[derive(Clone, Debug)]
@@ -279,7 +281,48 @@ pub fn null_transaction() -> Arc<dyn Transaction> {
 pub enum State {
     None,
     Scalar(Scalar),
+    Map(Map<State>),
     Collection(Collection),
+}
+
+struct StateMap(Map<State>);
+
+impl de::FromStream for StateMap {
+    type Context = Arc<dyn Transaction>;
+
+    async fn from_stream<D: de::Decoder>(
+        context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct StateMapVisitor {
+            context: Arc<dyn Transaction>,
+        }
+
+        impl de::Visitor for StateMapVisitor {
+            type Value = Map<State>;
+
+            fn expecting() -> &'static str {
+                "a TinyChain state map"
+            }
+
+            async fn visit_map<A: de::MapAccess>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut out = Map::new();
+                while let Some(key) = map.next_key::<String>(()).await? {
+                    let value = map.next_value::<State>(self.context.clone()).await?;
+                    out.insert(key, value);
+                }
+                Ok(out)
+            }
+        }
+
+        decoder
+            .decode_map(StateMapVisitor { context })
+            .await
+            .map(StateMap)
+    }
 }
 
 impl State {
@@ -383,6 +426,11 @@ impl de::FromStream for State {
                 })?;
 
                 match state_type {
+                    StateType::Map => {
+                        let StateMap(out) =
+                            map.next_value::<StateMap>(self.context.clone()).await?;
+                        Ok(State::Map(out))
+                    }
                     StateType::Collection(CollectionType::Tensor(_)) => {
                         let tensor = map.next_value::<Tensor>(self.context.clone()).await?;
                         drain_remaining_entries(&mut map).await?;
@@ -409,6 +457,11 @@ impl<'en> en::IntoStream<'en> for State {
             State::Scalar(Scalar::Ref(_)) => Err(E::Error::custom(
                 "cannot serialize Scalar::Ref as State until TCRef encoding is implemented",
             )),
+            State::Map(map) => {
+                let mut out = encoder.encode_map(Some(1))?;
+                out.encode_entry(STATE_SCALAR_MAP_PATH, map)?;
+                out.end()
+            }
             State::Collection(collection) => collection.into_stream(encoder),
         }
     }

@@ -3,15 +3,19 @@ use tc_ir::{Class, NativeClass};
 use tc_value::ValueType;
 
 const STATE_COLLECTION_TENSOR_PATH: PathLabel = path_label(&["state", "collection", "tensor"]);
+const STATE_SCALAR_MAP_PATH: PathLabel = path_label(&["state", "scalar", "map"]);
 
 const LABEL_STATE: Label = label("state");
 const LABEL_COLLECTION: Label = label("collection");
+const LABEL_MAP: Label = label("map");
+const LABEL_SCALAR: Label = label("scalar");
 const LABEL_TENSOR: Label = label("tensor");
 
 /// Transitional TinyChain state classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateType {
     Scalar(ValueType),
+    Map,
     Collection(CollectionType),
 }
 
@@ -19,6 +23,10 @@ impl Class for StateType {}
 
 impl NativeClass for StateType {
     fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if path_matches(path, &STATE_SCALAR_MAP_PATH) {
+            return Some(Self::Map);
+        }
+
         if let Some(collection) = CollectionType::from_path(path) {
             return Some(Self::Collection(collection));
         }
@@ -29,6 +37,10 @@ impl NativeClass for StateType {
     fn path(&self) -> PathBuf {
         match self {
             Self::Scalar(value_type) => value_type.path(),
+            Self::Map => PathBuf::new()
+                .append(LABEL_STATE)
+                .append(LABEL_SCALAR)
+                .append(LABEL_MAP),
             Self::Collection(collection_type) => collection_type.path(),
         }
     }
