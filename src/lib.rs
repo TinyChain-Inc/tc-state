@@ -15,10 +15,10 @@ use destream::{
 };
 use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead};
 use number_general::{FloatType, Number, UIntType};
+use pathlink::Link;
 use pathlink::PathBuf;
 use safecast::{CastInto, TryCastFrom};
-use pathlink::Link;
-use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
+use tc_ir::{Claim, Id, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::{number_type_from_path, number_type_path, NumberType, Value, ValueType};
 
 mod class;
@@ -282,10 +282,13 @@ pub enum State {
     None,
     Scalar(Scalar),
     Map(Map<State>),
+    Tuple(Vec<State>),
     Collection(Collection),
 }
 
 struct StateMap(Map<State>);
+
+struct StateSeq(Vec<State>);
 
 impl de::FromStream for StateMap {
     type Context = Arc<dyn Transaction>;
@@ -310,7 +313,7 @@ impl de::FromStream for StateMap {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut out = Map::new();
-                while let Some(key) = map.next_key::<String>(()).await? {
+                while let Some(key) = map.next_key::<Id>(()).await? {
                     let value = map.next_value::<State>(self.context.clone()).await?;
                     out.insert(key, value);
                 }
@@ -325,12 +328,57 @@ impl de::FromStream for StateMap {
     }
 }
 
+impl de::FromStream for StateSeq {
+    type Context = Arc<dyn Transaction>;
+
+    async fn from_stream<D: de::Decoder>(
+        context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        struct StateSeqVisitor {
+            context: Arc<dyn Transaction>,
+        }
+
+        impl de::Visitor for StateSeqVisitor {
+            type Value = Vec<State>;
+
+            fn expecting() -> &'static str {
+                "a TinyChain state tuple"
+            }
+
+            async fn visit_seq<A: de::SeqAccess>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut items: Vec<State> = if let Some(size) = seq.size_hint() {
+                    Vec::with_capacity(size)
+                } else {
+                    Vec::new()
+                };
+
+                while let Some(value) = seq.next_element::<State>(self.context.clone()).await? {
+                    items.push(value);
+                }
+
+                Ok(items)
+            }
+        }
+
+        decoder
+            .decode_seq(StateSeqVisitor { context })
+            .await
+            .map(StateSeq)
+    }
+}
+
 impl State {
     pub fn is_none(&self) -> bool {
-        matches!(
-            self,
-            State::None | State::Scalar(Scalar::Value(Value::None))
-        )
+        match self {
+            State::None => true,
+            State::Scalar(Scalar::Value(Value::None)) => true,
+            State::Tuple(items) => items.is_empty(),
+            _ => false,
+        }
     }
 }
 
@@ -402,20 +450,45 @@ impl de::FromStream for State {
                 self,
                 mut seq: A,
             ) -> Result<Self::Value, A::Error> {
-                while seq.next_element::<de::IgnoredAny>(()).await?.is_some() {}
-                Err(de::Error::custom(
-                    "TinyChain state cannot be decoded from a sequence",
-                ))
+                let mut items: Vec<State> = if let Some(size) = seq.size_hint() {
+                    Vec::with_capacity(size)
+                } else {
+                    Vec::new()
+                };
+
+                while let Some(value) = seq.next_element::<State>(self.context.clone()).await? {
+                    items.push(value);
+                }
+
+                Ok(State::Tuple(items))
             }
 
             async fn visit_map<A: de::MapAccess>(
                 self,
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
-                let key = map
-                    .next_key::<String>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("expected TinyChain state type path"))?;
+                let Some(key) = map.next_key::<String>(()).await? else {
+                    return Ok(State::Scalar(Scalar::Map(Map::new())));
+                };
+
+                if !key.starts_with('/') {
+                    let mut out = Map::<Scalar>::new();
+                    let value = map.next_value::<Scalar>(()).await?;
+                    let id: Id = key
+                        .parse::<Id>()
+                        .map_err(|err| de::Error::custom(err.to_string()))?;
+                    out.insert(id, value);
+
+                    while let Some(key) = map.next_key::<String>(()).await? {
+                        let value = map.next_value::<Scalar>(()).await?;
+                        let id: Id = key
+                            .parse::<Id>()
+                            .map_err(|err| de::Error::custom(err.to_string()))?;
+                        out.insert(id, value);
+                    }
+
+                    return Ok(State::Scalar(Scalar::Map(out)));
+                }
 
                 let path = key
                     .parse::<PathBuf>()
@@ -430,6 +503,12 @@ impl de::FromStream for State {
                         let StateMap(out) =
                             map.next_value::<StateMap>(self.context.clone()).await?;
                         Ok(State::Map(out))
+                    }
+                    StateType::Tuple => {
+                        let StateSeq(tuple) =
+                            map.next_value::<StateSeq>(self.context.clone()).await?;
+                        drain_remaining_entries(&mut map).await?;
+                        Ok(State::Tuple(tuple))
                     }
                     StateType::Collection(CollectionType::Tensor(_)) => {
                         let tensor = map.next_value::<Tensor>(self.context.clone()).await?;
@@ -453,15 +532,16 @@ impl<'en> en::IntoStream<'en> for State {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             State::None => encoder.encode_unit(),
-            State::Scalar(Scalar::Value(value)) => value.into_stream(encoder),
             State::Scalar(Scalar::Ref(_)) => Err(E::Error::custom(
                 "cannot serialize Scalar::Ref as State until TCRef encoding is implemented",
             )),
+            State::Scalar(scalar) => scalar.into_stream(encoder),
             State::Map(map) => {
                 let mut out = encoder.encode_map(Some(1))?;
                 out.encode_entry(STATE_SCALAR_MAP_PATH, map)?;
                 out.end()
             }
+            State::Tuple(items) => items.into_stream(encoder),
             State::Collection(collection) => collection.into_stream(encoder),
         }
     }
@@ -478,6 +558,12 @@ async fn decode_value_entry<A: de::MapAccess>(
     map: &mut A,
 ) -> Result<Value, A::Error> {
     match value_type {
+        ValueType::Link => {
+            let link_raw = map.next_value::<String>(()).await?;
+            let link = Link::from_str(&link_raw)
+                .map_err(|err| de::Error::custom(err.to_string()))?;
+            Ok(Value::Link(link))
+        }
         ValueType::Number => map.next_value::<Number>(()).await.map(Value::Number),
         ValueType::None => {
             let _ = map.next_value::<de::IgnoredAny>(()).await?;
