@@ -560,8 +560,8 @@ async fn decode_value_entry<A: de::MapAccess>(
     match value_type {
         ValueType::Link => {
             let link_raw = map.next_value::<String>(()).await?;
-            let link = Link::from_str(&link_raw)
-                .map_err(|err| de::Error::custom(err.to_string()))?;
+            let link =
+                Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
             Ok(Value::Link(link))
         }
         ValueType::Number => map.next_value::<Number>(()).await.map(Value::Number),
