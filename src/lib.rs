@@ -26,8 +26,6 @@ mod class;
 pub use class::{CollectionType, StateType, TensorType};
 pub use tc_ir::{Class, NativeClass};
 
-const STATE_SCALAR_MAP_PATH: &str = "/state/scalar/map";
-
 /// Temporary tensor representation (in-memory only).
 #[derive(Clone, Debug)]
 pub enum Tensor {
@@ -468,26 +466,26 @@ impl de::FromStream for State {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let Some(key) = map.next_key::<String>(()).await? else {
-                    return Ok(State::Scalar(Scalar::Map(Map::new())));
+                    return Ok(State::Map(Map::new()));
                 };
 
                 if !key.starts_with('/') {
-                    let mut out = Map::<Scalar>::new();
-                    let value = map.next_value::<Scalar>(()).await?;
+                    let mut out = Map::<State>::new();
+                    let value = map.next_value::<State>(self.context.clone()).await?;
                     let id: Id = key
                         .parse::<Id>()
                         .map_err(|err| de::Error::custom(err.to_string()))?;
                     out.insert(id, value);
 
                     while let Some(key) = map.next_key::<String>(()).await? {
-                        let value = map.next_value::<Scalar>(()).await?;
+                        let value = map.next_value::<State>(self.context.clone()).await?;
                         let id: Id = key
                             .parse::<Id>()
                             .map_err(|err| de::Error::custom(err.to_string()))?;
                         out.insert(id, value);
                     }
 
-                    return Ok(State::Scalar(Scalar::Map(out)));
+                    return Ok(State::Map(out));
                 }
 
                 let path = key
@@ -536,11 +534,7 @@ impl<'en> en::IntoStream<'en> for State {
                 "cannot serialize Scalar::Ref as State until TCRef encoding is implemented",
             )),
             State::Scalar(scalar) => scalar.into_stream(encoder),
-            State::Map(map) => {
-                let mut out = encoder.encode_map(Some(1))?;
-                out.encode_entry(STATE_SCALAR_MAP_PATH, map)?;
-                out.end()
-            }
+            State::Map(map) => map.into_stream(encoder),
             State::Tuple(items) => items.into_stream(encoder),
             State::Collection(collection) => collection.into_stream(encoder),
         }
@@ -736,5 +730,30 @@ mod tests {
             Tensor::F32(buf) => assert_eq!(buf.size(), 4),
             other => panic!("unexpected tensor variant {other:?}"),
         }
+    }
+
+    #[test]
+    fn state_map_round_trip_uses_plain_json_object() {
+        let mut map = Map::new();
+        map.insert("status".parse().expect("id"), State::from(Value::from("ok")));
+        map.insert("count".parse().expect("id"), State::from(Value::from(7_u64)));
+        let state = State::Map(map);
+
+        let encoded = encode_json(state);
+        let text = String::from_utf8(encoded.clone()).expect("utf-8");
+        assert!(text.starts_with('{'));
+        assert!(!text.contains("/state/scalar/map"));
+        assert!(text.contains("\"status\""));
+        assert!(text.contains("\"count\""));
+
+        let decoded: State = decode_json(null_transaction(), encoded);
+        assert!(matches!(decoded, State::Map(_)));
+    }
+
+    #[test]
+    fn decode_legacy_tagged_state_map() {
+        let tagged = br#"{"/state/scalar/map":{"status":"ok","count":7}}"#.to_vec();
+        let decoded: State = decode_json(null_transaction(), tagged);
+        assert!(matches!(decoded, State::Map(_)));
     }
 }
