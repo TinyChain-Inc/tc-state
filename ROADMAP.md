@@ -25,6 +25,33 @@ bootstrap (minimal control/auth blocks, authorized publishers config).
    store, install a WASM library, and confirm state snapshots match expectations.
    Cross-link these tests from the `tc-server` and control-plane roadmaps.
 
+## Phase 1A – Chain construction contract
+
+Goal: prepare the state layer for the v1 `SyncChain`/`BlockChain` port without
+inventing a temporary recovery mechanism.
+
+1. **Canonical construction API.** Define a small chain-construction helper which
+   derives the chain identity from the owning manifest and canonical component
+   root. Callers provide structured publisher/namespace/version data; the helper
+   builds the URI and txfs path so clients, adapters, and tests do not concatenate
+   path strings by hand.
+2. **`SyncChain` first.** Port the minimal append/read/replay behavior needed for
+   host-local recovery. The record format must carry the original transaction ID
+   and component identity directly; it must not add transaction-version IDs,
+   sub-transactions, or side tables.
+3. **`BlockChain` second.** Add ordered/checkpointed/attested records for
+   replicated or multi-cluster recovery after `SyncChain` proves the local replay
+   contract. Until this lands, replicated transaction finalize remains strict
+   all-prepared-participants retry, not quorum-based consensus.
+4. **Recovery handoff.** Expose replay as a state-layer iterator over durable
+   records, but keep interpretation in `tc-server` so transaction begin/continue,
+   commit, rollback, token chaining, and participant retry still use one kernel
+   code path.
+5. **Validation cases.** Cover deterministic construction, round-trip replay,
+   duplicate-record idempotence, restart after prepare, restart during unresolved
+   finalize, and rejection of records that cannot be tied to a canonical component
+   root and transaction ID.
+
 ## Phase 2 – Media storage primitives (recorded media)
 
 Goal: add block storage for images/audio/video backed by state collections.
