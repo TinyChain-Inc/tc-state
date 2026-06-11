@@ -30,6 +30,11 @@ bootstrap (minimal control/auth blocks, authorized publishers config).
 Goal: prepare the state layer for the v1 `SyncChain`/`BlockChain` port without
 inventing a temporary recovery mechanism.
 
+Parity requirement: implement the initial port as a behavior-preserving v1
+translation with minimal churn. Treat performance/reliability regression risk
+as a release gate by keeping append/replay/finalize semantics unchanged before
+any refactors or optimizations.
+
 1. **Canonical construction API.** Define a small chain-construction helper which
    derives the chain identity from the owning manifest and canonical component
    root. Callers provide structured publisher/namespace/version data; the helper
@@ -43,14 +48,18 @@ inventing a temporary recovery mechanism.
    replicated or multi-cluster recovery after `SyncChain` proves the local replay
    contract. Until this lands, replicated transaction finalize remains strict
    all-prepared-participants retry, not quorum-based consensus.
-4. **Recovery handoff.** Expose replay as a state-layer iterator over durable
+4. **Out-of-order finalize consistency.** For distributed finalize signals that
+   arrive out of order, reconcile by canonical replay order using the original
+   transaction identity and predecessor links. Do not introduce remapped
+   transaction identities or side tables.
+5. **Recovery handoff.** Expose replay as a state-layer iterator over durable
    records, but keep interpretation in `tc-server` so transaction begin/continue,
    commit, rollback, token chaining, and participant retry still use one kernel
    code path.
-5. **Validation cases.** Cover deterministic construction, round-trip replay,
-   duplicate-record idempotence, restart after prepare, restart during unresolved
-   finalize, and rejection of records that cannot be tied to a canonical component
-   root and transaction ID.
+6. **Validation cases.** Cover deterministic construction, round-trip replay,
+   ordering-permutation replay equivalence, duplicate-record idempotence, restart
+   after prepare, restart during unresolved finalize, and rejection of records
+   that cannot be tied to a canonical component root and transaction ID.
 
 ## Phase 2 – Media storage primitives (recorded media)
 
