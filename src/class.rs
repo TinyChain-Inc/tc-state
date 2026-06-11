@@ -4,7 +4,8 @@ use tc_value::ValueType;
 
 const STATE_COLLECTION_TENSOR_PATH: PathLabel = path_label(&["state", "collection", "tensor"]);
 const STATE_SCALAR_MAP_PATH: PathLabel = path_label(&["state", "scalar", "map"]);
-const STATE_TUPLE_PATH: PathLabel = path_label(&["state", "tuple"]);
+const STATE_SCALAR_TUPLE_PATH: PathLabel = path_label(&["state", "scalar", "tuple"]);
+const STATE_LEGACY_TUPLE_PATH: PathLabel = path_label(&["state", "tuple"]);
 
 const LABEL_STATE: Label = label("state");
 const LABEL_COLLECTION: Label = label("collection");
@@ -29,7 +30,9 @@ impl NativeClass for StateType {
         if path_matches(path, &STATE_SCALAR_MAP_PATH) {
             return Some(Self::Map);
         }
-        if path_matches(path, &STATE_TUPLE_PATH) {
+        if path_matches(path, &STATE_SCALAR_TUPLE_PATH)
+            || path_matches(path, &STATE_LEGACY_TUPLE_PATH)
+        {
             return Some(Self::Tuple);
         }
 
@@ -47,7 +50,10 @@ impl NativeClass for StateType {
                 .append(LABEL_STATE)
                 .append(LABEL_SCALAR)
                 .append(LABEL_MAP),
-            Self::Tuple => PathBuf::new().append(LABEL_STATE).append(LABEL_TUPLE),
+            Self::Tuple => PathBuf::new()
+                .append(LABEL_STATE)
+                .append(LABEL_SCALAR)
+                .append(LABEL_TUPLE),
             Self::Collection(collection_type) => collection_type.path(),
         }
     }
@@ -120,4 +126,31 @@ fn path_matches(path: &[PathSegment], expected: &PathLabel) -> bool {
             .iter()
             .enumerate()
             .all(|(i, segment)| segment.as_str() == expected[i])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tuple_path_is_canonical_scalar_tuple() {
+        let path = StateType::Tuple.path().to_string();
+        assert_eq!(path, "/state/scalar/tuple");
+    }
+
+    #[test]
+    fn accepts_legacy_and_canonical_tuple_paths() {
+        let canonical = "/state/scalar/tuple"
+            .parse::<PathBuf>()
+            .expect("canonical tuple path");
+        let legacy = "/state/tuple"
+            .parse::<PathBuf>()
+            .expect("legacy tuple path");
+
+        assert_eq!(
+            StateType::from_path(canonical.as_ref()),
+            Some(StateType::Tuple)
+        );
+        assert_eq!(StateType::from_path(legacy.as_ref()), Some(StateType::Tuple));
+    }
 }

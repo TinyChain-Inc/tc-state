@@ -530,9 +530,6 @@ impl<'en> en::IntoStream<'en> for State {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
             State::None => encoder.encode_unit(),
-            State::Scalar(Scalar::Ref(_)) => Err(E::Error::custom(
-                "cannot serialize Scalar::Ref as State until TCRef encoding is implemented",
-            )),
             State::Scalar(scalar) => scalar.into_stream(encoder),
             State::Map(map) => map.into_stream(encoder),
             State::Tuple(items) => items.into_stream(encoder),
@@ -552,18 +549,24 @@ async fn decode_value_entry<A: de::MapAccess>(
     map: &mut A,
 ) -> Result<Value, A::Error> {
     match value_type {
+        ValueType::Bool => map.next_value::<bool>(()).await.map(Value::Bool),
         ValueType::Link => {
             let link_raw = map.next_value::<String>(()).await?;
             let link =
                 Link::from_str(&link_raw).map_err(|err| de::Error::custom(err.to_string()))?;
             Ok(Value::Link(link))
         }
+        ValueType::Map => map
+            .next_value::<std::collections::BTreeMap<String, Value>>(())
+            .await
+            .map(Value::Map),
         ValueType::Number => map.next_value::<Number>(()).await.map(Value::Number),
         ValueType::None => {
             let _ = map.next_value::<de::IgnoredAny>(()).await?;
             Ok(Value::None)
         }
         ValueType::String => map.next_value::<String>(()).await.map(Value::String),
+        ValueType::Tuple => map.next_value::<Vec<Value>>(()).await.map(Value::Tuple),
     }
 }
 
@@ -755,5 +758,16 @@ mod tests {
         let tagged = br#"{"/state/scalar/map":{"status":"ok","count":7}}"#.to_vec();
         let decoded: State = decode_json(null_transaction(), tagged);
         assert!(matches!(decoded, State::Map(_)));
+    }
+
+    #[test]
+    fn state_scalar_ref_serializes() {
+        let state = State::Scalar(Scalar::from(tc_ir::TCRef::Id(
+            "$foo".parse().expect("IdRef"),
+        )));
+
+        let encoded = encode_json(state);
+        let text = String::from_utf8(encoded).expect("utf-8");
+        assert_eq!(text, r#"{"$foo":[]}"#);
     }
 }
