@@ -31,6 +31,8 @@ pub use tc_ir::{Class, NativeClass};
 pub enum Tensor {
     /// 32-bit floating point tensor.
     F32(Box<ArrayBuf<f32, Buffer<f32>>>),
+    /// 64-bit floating point tensor.
+    F64(Box<ArrayBuf<f64, Buffer<f64>>>),
     /// 64-bit unsigned integer tensor.
     U64(Box<ArrayBuf<u64, Buffer<u64>>>),
 }
@@ -43,6 +45,16 @@ impl Tensor {
         ArrayBuf::new(buffer, shape)
             .map(Box::new)
             .map(Tensor::F32)
+            .map_err(|err| err.to_string())
+    }
+
+    /// Construct a dense `f64` tensor from a shape and flattened values.
+    pub fn dense_f64(shape: Vec<usize>, values: Vec<f64>) -> Result<Self, String> {
+        let shape = shape.into();
+        let buffer = Buffer::from(values);
+        ArrayBuf::new(buffer, shape)
+            .map(Box::new)
+            .map(Tensor::F64)
             .map_err(|err| err.to_string())
     }
 
@@ -59,6 +71,7 @@ impl Tensor {
     pub fn shape(&self) -> &[usize] {
         match self {
             Tensor::F32(array) => array.shape(),
+            Tensor::F64(array) => array.shape(),
             Tensor::U64(array) => array.shape(),
         }
     }
@@ -71,7 +84,21 @@ impl Tensor {
                 .to_slice()
                 .map_err(|err| err.to_string())?
                 .into_vec()),
+            Tensor::F64(_) => Err("tensor dtype is not f32".to_string()),
             Tensor::U64(_) => Err("tensor dtype is not f32".to_string()),
+        }
+    }
+
+    pub fn flattened_f64(&self) -> Result<Vec<f64>, String> {
+        match self {
+            Tensor::F64(array) => Ok(array
+                .buffer()
+                .map_err(|err| err.to_string())?
+                .to_slice()
+                .map_err(|err| err.to_string())?
+                .into_vec()),
+            Tensor::F32(_) => Err("tensor dtype is not f64".to_string()),
+            Tensor::U64(_) => Err("tensor dtype is not f64".to_string()),
         }
     }
 
@@ -84,6 +111,7 @@ impl Tensor {
                 .map_err(|err| err.to_string())?
                 .into_vec()),
             Tensor::F32(_) => Err("tensor dtype is not u64".to_string()),
+            Tensor::F64(_) => Err("tensor dtype is not u64".to_string()),
         }
     }
 }
@@ -145,6 +173,24 @@ impl<'en> en::IntoStream<'en> for Tensor {
             Tensor::F32(array) => {
                 let schema = (
                     number_type_path(&NumberType::Float(FloatType::F32)).to_string(),
+                    array
+                        .shape()
+                        .iter()
+                        .map(|dim| *dim as u64)
+                        .collect::<Vec<_>>(),
+                );
+                seq.encode_element(schema)?;
+                let values = array
+                    .buffer()
+                    .map_err(E::Error::custom)?
+                    .to_slice()
+                    .map_err(E::Error::custom)?
+                    .into_vec();
+                seq.encode_element(values)?;
+            }
+            Tensor::F64(array) => {
+                let schema = (
+                    number_type_path(&NumberType::Float(FloatType::F64)).to_string(),
                     array
                         .shape()
                         .iter()
@@ -587,6 +633,10 @@ fn tensor_from_parts(
             let values = numbers_to_f32(values)?;
             Tensor::dense_f32(shape, values)
         }
+        NumberType::Float(FloatType::F64) => {
+            let values = numbers_to_f64(values)?;
+            Tensor::dense_f64(shape, values)
+        }
         NumberType::UInt(UIntType::U64) => {
             let values = numbers_to_u64(values)?;
             Tensor::dense_u64(shape, values)
@@ -602,6 +652,19 @@ fn coerce_shape(dims: Vec<u64>) -> Result<Vec<usize>, String> {
 }
 
 fn numbers_to_f32(values: Vec<Number>) -> Result<Vec<f32>, String> {
+    values
+        .into_iter()
+        .map(|number| {
+            if matches!(number, Number::Complex(_)) {
+                Err("complex numbers are not supported in tensors".into())
+            } else {
+                Ok(number.cast_into())
+            }
+        })
+        .collect()
+}
+
+fn numbers_to_f64(values: Vec<Number>) -> Result<Vec<f64>, String> {
     values
         .into_iter()
         .map(|number| {
@@ -721,6 +784,17 @@ mod tests {
                 assert_eq!(buf.size(), 4);
             }
             other => panic!("unexpected state {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tensor_f64_round_trip() {
+        let tensor = Tensor::dense_f64(vec![2], vec![1.5, 2.5]).expect("dense tensor");
+        let bytes = encode_json(tensor.clone());
+        let decoded: Tensor = decode_json(null_transaction(), bytes);
+        match decoded {
+            Tensor::F64(buf) => assert_eq!(buf.size(), 2),
+            other => panic!("unexpected tensor variant {other:?}"),
         }
     }
 
