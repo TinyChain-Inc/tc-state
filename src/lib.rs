@@ -595,7 +595,6 @@ async fn decode_value_entry<A: de::MapAccess>(
     map: &mut A,
 ) -> Result<Value, A::Error> {
     match value_type {
-        ValueType::Bool => map.next_value::<bool>(()).await.map(Value::Bool),
         ValueType::Link => {
             let link_raw = map.next_value::<String>(()).await?;
             let link =
