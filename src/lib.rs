@@ -812,8 +812,14 @@ mod tests {
     #[test]
     fn state_map_round_trip_uses_plain_json_object() {
         let mut map = Map::new();
-        map.insert("status".parse().expect("id"), State::from(Value::from("ok")));
-        map.insert("count".parse().expect("id"), State::from(Value::from(7_u64)));
+        map.insert(
+            "status".parse().expect("id"),
+            State::from(Value::from("ok")),
+        );
+        map.insert(
+            "count".parse().expect("id"),
+            State::from(Value::from(7_u64)),
+        );
         let state = State::Map(map);
 
         let encoded = encode_json(state);

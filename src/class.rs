@@ -151,6 +151,9 @@ mod tests {
             StateType::from_path(canonical.as_ref()),
             Some(StateType::Tuple)
         );
-        assert_eq!(StateType::from_path(legacy.as_ref()), Some(StateType::Tuple));
+        assert_eq!(
+            StateType::from_path(legacy.as_ref()),
+            Some(StateType::Tuple)
+        );
     }
 }

@@ -8,7 +8,7 @@ async-trait = "0.1"
 destream = "0.10"
 ha-ndarray = "0.5"
 number-general = { version = "0.14", default-features = false, features = ["stream"] }
-pathlink = { path = "../deps/pathlink" }
+pathlink = "0.4"
 safecast = "0.2"
 tc-ir = { path = "../tc-ir" }
 tc-value = { path = "../tc-value" }
