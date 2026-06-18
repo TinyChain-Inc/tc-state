@@ -13,7 +13,7 @@ use destream::{
     en::{self, EncodeMap, EncodeSeq, Error as _},
     IntoStream,
 };
-use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead};
+use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead, NDArrayTransform};
 use number_general::{FloatType, Number, UIntType};
 use pathlink::Link;
 use pathlink::PathBuf;
@@ -24,6 +24,7 @@ use tc_value::{number_type_from_path, number_type_path, NumberType, Value, Value
 mod class;
 
 pub use class::{CollectionType, StateType, TensorType};
+pub use ha_ndarray::{AxisRange, Range};
 pub use tc_ir::{Class, NativeClass};
 
 /// Temporary tensor representation (in-memory only).
@@ -35,6 +36,12 @@ pub enum Tensor {
     F64(Box<ArrayBuf<f64, Buffer<f64>>>),
     /// 64-bit unsigned integer tensor.
     U64(Box<ArrayBuf<u64, Buffer<u64>>>),
+}
+
+#[derive(Clone, Debug)]
+pub enum TensorReduceResult {
+    Scalar(Number),
+    Tensor(Tensor),
 }
 
 impl Tensor {
@@ -76,6 +83,26 @@ impl Tensor {
         }
     }
 
+    pub fn number_type(&self) -> NumberType {
+        match self {
+            Tensor::F32(_) => NumberType::Float(FloatType::F32),
+            Tensor::F64(_) => NumberType::Float(FloatType::F64),
+            Tensor::U64(_) => NumberType::UInt(UIntType::U64),
+        }
+    }
+
+    pub fn dtype_tag(&self) -> &'static str {
+        match self {
+            Tensor::F32(_) => "f32",
+            Tensor::F64(_) => "f64",
+            Tensor::U64(_) => "u64",
+        }
+    }
+
+    pub fn size(&self) -> usize {
+        self.shape().iter().product()
+    }
+
     pub fn flattened_f32(&self) -> Result<Vec<f32>, String> {
         match self {
             Tensor::F32(array) => Ok(array
@@ -112,6 +139,680 @@ impl Tensor {
                 .into_vec()),
             Tensor::F32(_) => Err("tensor dtype is not u64".to_string()),
             Tensor::F64(_) => Err("tensor dtype is not u64".to_string()),
+        }
+    }
+
+    pub fn values_f64(&self) -> Result<Vec<f64>, String> {
+        match self {
+            Tensor::F32(_) => Ok(self.flattened_f32()?.into_iter().map(f64::from).collect()),
+            Tensor::F64(_) => self.flattened_f64(),
+            Tensor::U64(_) => Ok(self
+                .flattened_u64()?
+                .into_iter()
+                .map(|value| value as f64)
+                .collect()),
+        }
+    }
+
+    pub fn from_f64_like(&self, shape: Vec<usize>, values: Vec<f64>) -> Result<Self, String> {
+        match self {
+            Tensor::F64(_) => Tensor::dense_f64(shape, values),
+            Tensor::U64(_)
+                if values
+                    .iter()
+                    .all(|value| *value >= 0.0 && value.fract() == 0.0) =>
+            {
+                Tensor::dense_u64(
+                    shape,
+                    values.into_iter().map(|value| value as u64).collect(),
+                )
+            }
+            _ => Tensor::dense_f32(
+                shape,
+                values.into_iter().map(|value| value as f32).collect(),
+            ),
+        }
+    }
+
+    pub fn cast(self, dtype: &str) -> Result<Self, String> {
+        let dtype = normalize_dtype_tag(dtype)
+            .ok_or_else(|| format!("unsupported tensor dtype {dtype}"))?;
+
+        if self.dtype_tag() == dtype {
+            return Ok(self);
+        }
+
+        let shape = self.shape().to_vec();
+        let values = self.values_f64()?;
+
+        match dtype {
+            "f32" => Tensor::dense_f32(shape, values.into_iter().map(|v| v as f32).collect()),
+            "f64" => Tensor::dense_f64(shape, values),
+            "u64" => {
+                let mut out = Vec::with_capacity(values.len());
+                for value in values {
+                    if !value.is_finite() {
+                        return Err("tensor cast to u64 requires finite values".to_string());
+                    }
+                    if value < 0.0 || value.fract() != 0.0 {
+                        return Err(format!(
+                            "tensor cast to u64 requires non-negative whole numbers, found {value}"
+                        ));
+                    }
+                    out.push(value as u64);
+                }
+
+                Tensor::dense_u64(shape, out)
+            }
+            other => Err(format!("unsupported tensor dtype {other}")),
+        }
+    }
+
+    pub fn read_value(&self, coord: &[u64]) -> Result<Number, String> {
+        let offset = coord_offset(self.shape(), coord)?;
+
+        match self {
+            Tensor::F32(_) => Ok(Number::from(self.flattened_f32()?[offset])),
+            Tensor::F64(_) => Ok(Number::from(self.flattened_f64()?[offset])),
+            Tensor::U64(_) => Ok(Number::from(self.flattened_u64()?[offset])),
+        }
+    }
+
+    pub fn write_value(&mut self, coord: &[u64], value: Number) -> Result<(), String> {
+        let shape = self.shape().to_vec();
+        let offset = coord_offset(&shape, coord)?;
+
+        let next = match self {
+            Tensor::F32(_) => {
+                ensure_non_complex(&value)?;
+                let mut values = self.flattened_f32()?;
+                values[offset] = value.cast_into();
+                Tensor::dense_f32(shape, values)?
+            }
+            Tensor::F64(_) => {
+                ensure_non_complex(&value)?;
+                let mut values = self.flattened_f64()?;
+                values[offset] = value.cast_into();
+                Tensor::dense_f64(shape, values)?
+            }
+            Tensor::U64(_) => {
+                ensure_tensor_u64_component(&value)?;
+                let mut values = self.flattened_u64()?;
+                values[offset] = value.cast_into();
+                Tensor::dense_u64(shape, values)?
+            }
+        };
+
+        *self = next;
+        Ok(())
+    }
+
+    pub fn reshape(self, shape: Vec<usize>) -> Result<Self, String> {
+        if shape.iter().product::<usize>() != self.size() {
+            return Err("tensor reshape changes size".to_string());
+        }
+
+        self.from_f64_like(shape, self.values_f64()?)
+    }
+
+    pub fn expand_dims(self, axes: Option<Vec<usize>>) -> Result<Self, String> {
+        let mut shape = self.shape().to_vec();
+
+        if let Some(axes) = axes {
+            for axis in axes {
+                if axis > shape.len() {
+                    return Err("expand_dims axis out of bounds".to_string());
+                }
+
+                shape.insert(axis, 1);
+            }
+        } else {
+            shape.push(1);
+        }
+
+        self.from_f64_like(shape, self.values_f64()?)
+    }
+
+    pub fn broadcast(self, shape: Vec<usize>) -> Result<Self, String> {
+        let source_shape = self.shape().to_vec();
+        if !can_broadcast_to(&source_shape, &shape) {
+            return Err(format!(
+                "cannot broadcast tensor shape {:?} into {:?}",
+                source_shape, shape
+            ));
+        }
+
+        let source_values = self.values_f64()?;
+        let out_len = shape.iter().product::<usize>();
+        let mut out = Vec::with_capacity(out_len);
+
+        for linear_idx in 0..out_len {
+            let out_coord = unravel_index(linear_idx, &shape);
+            let source_coord = project_broadcast_index(&out_coord, &source_shape)?;
+            let source_offset = coord_offset_usize(&source_shape, &source_coord)?;
+            out.push(source_values[source_offset]);
+        }
+
+        self.from_f64_like(shape, out)
+    }
+
+    pub fn transpose(self, permutation: Option<Vec<usize>>) -> Result<Self, String> {
+        let shape = self.shape().to_vec();
+        let permutation = if let Some(permutation) = permutation {
+            if permutation.len() != shape.len() {
+                return Err("transpose permutation rank must match tensor rank".to_string());
+            }
+
+            let mut seen = vec![false; shape.len()];
+            for axis in &permutation {
+                if *axis >= shape.len() {
+                    return Err("transpose axis out of bounds".to_string());
+                }
+                if seen[*axis] {
+                    return Err("transpose permutation contains duplicate axis".to_string());
+                }
+                seen[*axis] = true;
+            }
+
+            permutation
+        } else {
+            (0..shape.len()).rev().collect()
+        };
+
+        let out_shape: Vec<usize> = permutation.iter().map(|axis| shape[*axis]).collect();
+        let out_len = out_shape.iter().product::<usize>();
+        let values = self.values_f64()?;
+        let mut out = vec![0.0; out_len];
+
+        for (linear_idx, out_value) in out.iter_mut().enumerate() {
+            let out_coord = unravel_index(linear_idx, &out_shape);
+            let mut in_coord = vec![0usize; shape.len()];
+            for (out_axis, in_axis) in permutation.iter().copied().enumerate() {
+                in_coord[in_axis] = out_coord[out_axis];
+            }
+
+            let in_offset = coord_offset_usize(&shape, &in_coord)?;
+            *out_value = values[in_offset];
+        }
+
+        self.from_f64_like(out_shape, out)
+    }
+
+    pub fn slice(self, range: Range) -> Result<Self, String> {
+        match self {
+            Tensor::F32(array) => {
+                let sliced = array.slice(range.clone()).map_err(|err| err.to_string())?;
+                let shape = sliced.shape().to_vec();
+                let values = sliced
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+
+                Tensor::dense_f32(shape, values)
+            }
+            Tensor::F64(array) => {
+                let sliced = array.slice(range.clone()).map_err(|err| err.to_string())?;
+                let shape = sliced.shape().to_vec();
+                let values = sliced
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+
+                Tensor::dense_f64(shape, values)
+            }
+            Tensor::U64(array) => {
+                let sliced = array.slice(range).map_err(|err| err.to_string())?;
+                let shape = sliced.shape().to_vec();
+                let values = sliced
+                    .buffer()
+                    .map_err(|err| err.to_string())?
+                    .to_slice()
+                    .map_err(|err| err.to_string())?
+                    .into_vec();
+
+                Tensor::dense_u64(shape, values)
+            }
+        }
+    }
+
+    pub fn reduce(&self, op: &str) -> Result<Number, String> {
+        let values = self.values_f64()?;
+        if values.is_empty() {
+            return Err("cannot reduce an empty tensor".to_string());
+        }
+
+        let value = match op {
+            "max" => values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+            "min" => values.iter().copied().fold(f64::INFINITY, f64::min),
+            "mean" => values.iter().sum::<f64>() / values.len() as f64,
+            "norm" => values.iter().map(|v| v * v).sum::<f64>().sqrt(),
+            "product" => values.iter().product::<f64>(),
+            "std" => {
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                (values.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / values.len() as f64)
+                    .sqrt()
+            }
+            "sum" => values.iter().sum::<f64>(),
+            other => return Err(format!("unsupported tensor reduction {other}")),
+        };
+
+        Ok(Number::from(value))
+    }
+
+    pub fn reduce_axes(
+        &self,
+        op: &str,
+        axes: Option<Vec<usize>>,
+        keepdims: bool,
+    ) -> Result<TensorReduceResult, String> {
+        let shape = self.shape().to_vec();
+        let rank = shape.len();
+        let values = self.values_f64()?;
+
+        if values.is_empty() {
+            return Err("cannot reduce an empty tensor".to_string());
+        }
+
+        let axes = axes.unwrap_or_else(|| (0..rank).collect());
+        let mut reduce_mask = vec![false; rank];
+        for axis in axes {
+            if axis >= rank {
+                return Err(format!("reduction axis {axis} is out of bounds"));
+            }
+            reduce_mask[axis] = true;
+        }
+
+        let out_shape = if keepdims {
+            shape
+                .iter()
+                .enumerate()
+                .map(|(axis, dim)| if reduce_mask[axis] { 1 } else { *dim })
+                .collect::<Vec<_>>()
+        } else {
+            shape
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, dim)| (!reduce_mask[axis]).then_some(*dim))
+                .collect::<Vec<_>>()
+        };
+
+        let in_strides = strides(&shape);
+        let out_strides = strides(&out_shape);
+        let out_size = if out_shape.is_empty() {
+            1
+        } else {
+            out_shape.iter().product()
+        };
+
+        let mut acc = vec![ReduceAccum::default(); out_size];
+        for (flat_idx, value) in values.into_iter().enumerate() {
+            let coord = coord_from_offset(flat_idx, &shape, &in_strides);
+
+            let out_coord = if keepdims {
+                coord
+                    .iter()
+                    .enumerate()
+                    .map(|(axis, c)| if reduce_mask[axis] { 0 } else { *c })
+                    .collect::<Vec<_>>()
+            } else {
+                coord
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(axis, c)| (!reduce_mask[axis]).then_some(*c))
+                    .collect::<Vec<_>>()
+            };
+
+            let out_offset = offset_from_coord(&out_coord, &out_strides);
+            acc[out_offset].update(value);
+        }
+
+        let out_values = acc
+            .into_iter()
+            .map(|acc| acc.finalize(op))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        if out_shape.is_empty() {
+            Ok(TensorReduceResult::Scalar(Number::from(out_values[0])))
+        } else {
+            let tensor = self.from_f64_like(out_shape, out_values)?;
+            Ok(TensorReduceResult::Tensor(tensor))
+        }
+    }
+
+    pub fn binary_op(&self, right: &Self, op: &str) -> Result<Self, String> {
+        let left_values = self.values_f64()?;
+        let right_values = right.values_f64()?;
+        let shape = broadcast_shape(self.shape(), right.shape())?;
+
+        let len = shape.iter().product::<usize>();
+        let out = (0..len)
+            .map(|idx| {
+                let out_coord = unravel_index(idx, &shape);
+                let left_coord = project_broadcast_index(&out_coord, self.shape())?;
+                let right_coord = project_broadcast_index(&out_coord, right.shape())?;
+
+                let l = left_values[coord_offset_usize(self.shape(), &left_coord)?];
+                let r = right_values[coord_offset_usize(right.shape(), &right_coord)?];
+                match op {
+                    "add" => Ok(l + r),
+                    "sub" => Ok(l - r),
+                    "mul" => Ok(l * r),
+                    "div" => Ok(l / r),
+                    "and" => Ok(f64::from(l != 0.0 && r != 0.0)),
+                    "or" => Ok(f64::from(l != 0.0 || r != 0.0)),
+                    "xor" => Ok(f64::from((l != 0.0) ^ (r != 0.0))),
+                    other => Err(format!("unsupported tensor binary op {other}")),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        self.from_f64_like(shape, out)
+    }
+
+    pub fn unary_not(&self) -> Result<Self, String> {
+        let values = self
+            .values_f64()?
+            .into_iter()
+            .map(|value| f64::from(value == 0.0))
+            .collect();
+
+        self.from_f64_like(self.shape().to_vec(), values)
+    }
+
+    pub fn cond(cond: &Self, then_tensor: &Self, else_tensor: &Self) -> Result<Self, String> {
+        let cond_values = cond.values_f64()?;
+        let then_values = then_tensor.values_f64()?;
+        let else_values = else_tensor.values_f64()?;
+
+        if then_values.len() != else_values.len() {
+            return Err("tensor cond branches must have equal size".to_string());
+        }
+
+        if cond_values.len() != 1 && cond_values.len() != then_values.len() {
+            return Err("tensor cond must be scalar or equal size".to_string());
+        }
+
+        let out = (0..then_values.len())
+            .map(|idx| {
+                if cond_values[if cond_values.len() == 1 { 0 } else { idx }] != 0.0 {
+                    then_values[idx]
+                } else {
+                    else_values[idx]
+                }
+            })
+            .collect();
+
+        then_tensor.from_f64_like(then_tensor.shape().to_vec(), out)
+    }
+
+    pub fn matmul(&self, right: &Self) -> Result<Self, String> {
+        let left_shape = self.shape();
+        let right_shape = right.shape();
+        if left_shape.len() != 2 || right_shape.len() != 2 {
+            return Err("tensor matmul currently supports 2D tensors".to_string());
+        }
+
+        let rows = left_shape[0];
+        let inner = left_shape[1];
+        if right_shape[0] != inner {
+            return Err("tensor matmul inner dimensions do not match".to_string());
+        }
+
+        let cols = right_shape[1];
+        let left_values = self.values_f64()?;
+        let right_values = right.values_f64()?;
+        let mut out = vec![0.0; rows * cols];
+        for row in 0..rows {
+            for col in 0..cols {
+                let mut sum = 0.0;
+                for k in 0..inner {
+                    sum += left_values[row * inner + k] * right_values[k * cols + col];
+                }
+                out[row * cols + col] = sum;
+            }
+        }
+
+        self.from_f64_like(vec![rows, cols], out)
+    }
+}
+
+fn ensure_non_complex(number: &Number) -> Result<(), String> {
+    if matches!(number, Number::Complex(_)) {
+        Err("complex numbers are not supported in tensors".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_dtype_tag(dtype: &str) -> Option<&'static str> {
+    if dtype == "f32" || dtype.ends_with("/float/32") {
+        Some("f32")
+    } else if dtype == "f64" || dtype.ends_with("/float/64") {
+        Some("f64")
+    } else if dtype == "u64" || dtype.ends_with("/uint/64") {
+        Some("u64")
+    } else {
+        None
+    }
+}
+
+fn can_broadcast_to(source: &[usize], target: &[usize]) -> bool {
+    if source.len() > target.len() {
+        return false;
+    }
+
+    source
+        .iter()
+        .rev()
+        .zip(target.iter().rev())
+        .all(|(left, right)| *left == 1 || left == right)
+}
+
+fn broadcast_shape(left: &[usize], right: &[usize]) -> Result<Vec<usize>, String> {
+    let ndim = usize::max(left.len(), right.len());
+    let mut out = vec![1usize; ndim];
+
+    for i in 0..ndim {
+        let l = left
+            .len()
+            .checked_sub(i + 1)
+            .and_then(|idx| left.get(idx))
+            .copied()
+            .unwrap_or(1);
+        let r = right
+            .len()
+            .checked_sub(i + 1)
+            .and_then(|idx| right.get(idx))
+            .copied()
+            .unwrap_or(1);
+
+        out[ndim - i - 1] = if l == r {
+            l
+        } else if l == 1 {
+            r
+        } else if r == 1 {
+            l
+        } else {
+            return Err(format!(
+                "tensor shapes {:?} and {:?} are not broadcast-compatible",
+                left, right
+            ));
+        };
+    }
+
+    Ok(out)
+}
+
+fn project_broadcast_index(
+    out_coord: &[usize],
+    source_shape: &[usize],
+) -> Result<Vec<usize>, String> {
+    if source_shape.len() > out_coord.len() {
+        return Err("source rank exceeds output rank for broadcast".to_string());
+    }
+
+    let mut source_coord = vec![0usize; source_shape.len()];
+    let offset = out_coord.len() - source_shape.len();
+
+    for (axis, dim) in source_shape.iter().copied().enumerate() {
+        source_coord[axis] = if dim == 1 {
+            0
+        } else {
+            out_coord[offset + axis]
+        };
+    }
+
+    Ok(source_coord)
+}
+
+fn unravel_index(mut linear_idx: usize, shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+
+    let mut coord = vec![0usize; shape.len()];
+    for axis in (0..shape.len()).rev() {
+        let dim = shape[axis];
+        coord[axis] = linear_idx % dim;
+        linear_idx /= dim;
+    }
+
+    coord
+}
+
+fn coord_offset_usize(shape: &[usize], coord: &[usize]) -> Result<usize, String> {
+    if coord.len() != shape.len() {
+        return Err("incorrect number of coordinates".to_string());
+    }
+
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+    for axis in (0..shape.len()).rev() {
+        let dim = shape[axis];
+        let value = coord[axis];
+        if value >= dim {
+            return Err(format!("coordinate at axis {axis} is out of bounds"));
+        }
+        offset += value * stride;
+        stride *= dim;
+    }
+
+    Ok(offset)
+}
+
+fn coord_offset(shape: &[usize], coord: &[u64]) -> Result<usize, String> {
+    if coord.len() != shape.len() {
+        return Err("incorrect number of coordinates".to_string());
+    }
+
+    let mut offset = 0usize;
+    let mut stride = 1usize;
+
+    for (axis, dim) in shape.iter().enumerate().rev() {
+        let value = usize::try_from(coord[axis])
+            .map_err(|_| format!("coordinate at axis {axis} overflows usize"))?;
+
+        if value >= *dim {
+            return Err(format!("coordinate at axis {axis} is out of bounds"));
+        }
+
+        offset += value * stride;
+        stride *= *dim;
+    }
+
+    Ok(offset)
+}
+
+fn strides(shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+
+    let mut strides = vec![1; shape.len()];
+    for axis in (0..shape.len() - 1).rev() {
+        strides[axis] = strides[axis + 1] * shape[axis + 1];
+    }
+    strides
+}
+
+fn coord_from_offset(offset: usize, shape: &[usize], strides: &[usize]) -> Vec<usize> {
+    if shape.is_empty() {
+        return Vec::new();
+    }
+
+    let mut remainder = offset;
+    let mut coord = vec![0; shape.len()];
+    for axis in 0..shape.len() {
+        let stride = strides[axis];
+        coord[axis] = remainder / stride;
+        remainder %= stride;
+    }
+    coord
+}
+
+fn offset_from_coord(coord: &[usize], strides: &[usize]) -> usize {
+    coord
+        .iter()
+        .zip(strides.iter())
+        .map(|(value, stride)| value * stride)
+        .sum()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ReduceAccum {
+    initialized: bool,
+    count: usize,
+    sum: f64,
+    sumsq: f64,
+    product: f64,
+    min: f64,
+    max: f64,
+}
+
+impl ReduceAccum {
+    fn update(&mut self, value: f64) {
+        if !self.initialized {
+            self.initialized = true;
+            self.count = 1;
+            self.sum = value;
+            self.sumsq = value * value;
+            self.product = value;
+            self.min = value;
+            self.max = value;
+            return;
+        }
+
+        self.count += 1;
+        self.sum += value;
+        self.sumsq += value * value;
+        self.product *= value;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+    }
+
+    fn finalize(self, op: &str) -> Result<f64, String> {
+        if !self.initialized {
+            return Err("cannot reduce an empty tensor".to_string());
+        }
+
+        match op {
+            "max" => Ok(self.max),
+            "min" => Ok(self.min),
+            "mean" => Ok(self.sum / self.count as f64),
+            "norm" => Ok(self.sumsq.sqrt()),
+            "product" => Ok(self.product),
+            "std" => {
+                let mean = self.sum / self.count as f64;
+                Ok((self.sumsq / self.count as f64 - mean * mean)
+                    .max(0.0)
+                    .sqrt())
+            }
+            "sum" => Ok(self.sum),
+            other => Err(format!("unsupported tensor reduction {other}")),
         }
     }
 }
@@ -330,47 +1031,7 @@ pub enum State {
     Collection(Collection),
 }
 
-struct StateMap(Map<State>);
-
 struct StateSeq(Vec<State>);
-
-impl de::FromStream for StateMap {
-    type Context = Arc<dyn Transaction>;
-
-    async fn from_stream<D: de::Decoder>(
-        context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct StateMapVisitor {
-            context: Arc<dyn Transaction>,
-        }
-
-        impl de::Visitor for StateMapVisitor {
-            type Value = Map<State>;
-
-            fn expecting() -> &'static str {
-                "a TinyChain state map"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut out = Map::new();
-                while let Some(key) = map.next_key::<Id>(()).await? {
-                    let value = map.next_value::<State>(self.context.clone()).await?;
-                    out.insert(key, value);
-                }
-                Ok(out)
-            }
-        }
-
-        decoder
-            .decode_map(StateMapVisitor { context })
-            .await
-            .map(StateMap)
-    }
-}
 
 impl de::FromStream for StateSeq {
     type Context = Arc<dyn Transaction>;
@@ -543,11 +1204,6 @@ impl de::FromStream for State {
                 })?;
 
                 match state_type {
-                    StateType::Map => {
-                        let StateMap(out) =
-                            map.next_value::<StateMap>(self.context.clone()).await?;
-                        Ok(State::Map(out))
-                    }
                     StateType::Tuple => {
                         let StateSeq(tuple) =
                             map.next_value::<StateSeq>(self.context.clone()).await?;
@@ -811,8 +1467,14 @@ mod tests {
     #[test]
     fn state_map_round_trip_uses_plain_json_object() {
         let mut map = Map::new();
-        map.insert("status".parse().expect("id"), State::from(Value::from("ok")));
-        map.insert("count".parse().expect("id"), State::from(Value::from(7_u64)));
+        map.insert(
+            "status".parse().expect("id"),
+            State::from(Value::from("ok")),
+        );
+        map.insert(
+            "count".parse().expect("id"),
+            State::from(Value::from(7_u64)),
+        );
         let state = State::Map(map);
 
         let encoded = encode_json(state);
@@ -827,13 +1489,6 @@ mod tests {
     }
 
     #[test]
-    fn decode_legacy_tagged_state_map() {
-        let tagged = br#"{"/state/scalar/map":{"status":"ok","count":7}}"#.to_vec();
-        let decoded: State = decode_json(null_transaction(), tagged);
-        assert!(matches!(decoded, State::Map(_)));
-    }
-
-    #[test]
     fn state_scalar_ref_serializes() {
         let state = State::Scalar(Scalar::from(tc_ir::TCRef::Id(
             "$foo".parse().expect("IdRef"),
@@ -842,5 +1497,128 @@ mod tests {
         let encoded = encode_json(state);
         let text = String::from_utf8(encoded).expect("utf-8");
         assert_eq!(text, r#"{"$foo":[]}"#);
+    }
+
+    #[test]
+    fn tensor_facade_read_write_value_roundtrip() {
+        let mut tensor = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("tensor");
+
+        let value = tensor.read_value(&[1, 0]).expect("read value");
+        let value: f64 = value.cast_into();
+        assert_eq!(value, 3.0);
+
+        tensor
+            .write_value(&[0, 1], Number::from(9.5_f64))
+            .expect("write value");
+
+        assert_eq!(
+            tensor.flattened_f32().expect("values"),
+            vec![1.0, 9.5, 3.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn tensor_facade_transpose_2d() {
+        let tensor = Tensor::dense_u64(vec![2, 3], vec![1, 2, 3, 4, 5, 6]).expect("tensor");
+
+        let transposed = tensor.transpose(None).expect("transpose");
+        assert_eq!(transposed.shape(), &[3, 2]);
+        assert_eq!(
+            transposed.flattened_u64().expect("values"),
+            vec![1, 4, 2, 5, 3, 6]
+        );
+    }
+
+    #[test]
+    fn tensor_facade_binary_and_reduce() {
+        let left = Tensor::dense_f64(vec![2], vec![1.0, 3.0]).expect("left");
+        let right = Tensor::dense_f64(vec![2], vec![2.0, 4.0]).expect("right");
+
+        let added = left.binary_op(&right, "add").expect("binary add");
+        assert_eq!(added.flattened_f64().expect("values"), vec![3.0, 7.0]);
+
+        let reduced = added.reduce("sum").expect("reduce sum");
+        let reduced: f64 = reduced.cast_into();
+        assert_eq!(reduced, 10.0);
+    }
+
+    #[test]
+    fn tensor_facade_reduce_axes_keepdims() {
+        let tensor =
+            Tensor::dense_f64(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("source tensor");
+
+        let reduced = tensor
+            .reduce_axes("sum", Some(vec![1]), true)
+            .expect("reduce axes");
+
+        match reduced {
+            TensorReduceResult::Tensor(tensor) => {
+                assert_eq!(tensor.shape(), &[2, 1]);
+                assert_eq!(tensor.flattened_f64().expect("values"), vec![3.0, 7.0]);
+            }
+            other => panic!("expected reduced tensor but found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tensor_facade_cast_to_u64() {
+        let tensor = Tensor::dense_f64(vec![3], vec![1.0, 2.0, 3.0]).expect("source tensor");
+        let cast = tensor.cast("u64").expect("cast");
+
+        assert_eq!(cast.dtype_tag(), "u64");
+        assert_eq!(cast.flattened_u64().expect("values"), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn tensor_facade_transpose_3d_permutation() {
+        let tensor =
+            Tensor::dense_u64(vec![2, 3, 2], (0_u64..12_u64).collect()).expect("source tensor");
+        let transposed = tensor.transpose(Some(vec![2, 0, 1])).expect("transpose");
+
+        assert_eq!(transposed.shape(), &[2, 2, 3]);
+        assert_eq!(
+            transposed.flattened_u64().expect("values"),
+            vec![0, 2, 4, 6, 8, 10, 1, 3, 5, 7, 9, 11]
+        );
+    }
+
+    #[test]
+    fn tensor_facade_binary_broadcast() {
+        let left =
+            Tensor::dense_f64(vec![2, 1], vec![1.0, 2.0]).expect("left broadcast source tensor");
+        let right = Tensor::dense_f64(vec![1, 3], vec![10.0, 20.0, 30.0]).expect("right tensor");
+
+        let sum = left.binary_op(&right, "add").expect("broadcast add");
+        assert_eq!(sum.shape(), &[2, 3]);
+        assert_eq!(
+            sum.flattened_f64().expect("values"),
+            vec![11.0, 21.0, 31.0, 12.0, 22.0, 32.0]
+        );
+    }
+
+    #[test]
+    fn tensor_facade_matmul_2d() {
+        let left = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("left");
+        let right = Tensor::dense_f32(vec![2, 2], vec![5.0, 6.0, 7.0, 8.0]).expect("right");
+
+        let out = left.matmul(&right).expect("matmul");
+        assert_eq!(out.shape(), &[2, 2]);
+        assert_eq!(
+            out.flattened_f32().expect("values"),
+            vec![19.0, 22.0, 43.0, 50.0]
+        );
+    }
+
+    #[test]
+    fn tensor_facade_slice_range() {
+        let tensor = Tensor::dense_u64(vec![3, 4], (0_u64..12_u64).collect()).expect("tensor");
+
+        let mut range = Range::new();
+        range.push(AxisRange::In(1, 3, 1));
+        range.push(AxisRange::In(1, 3, 1));
+
+        let sliced = tensor.slice(range).expect("slice");
+        assert_eq!(sliced.shape(), &[2, 2]);
+        assert_eq!(sliced.flattened_u64().expect("values"), vec![5, 6, 9, 10]);
     }
 }

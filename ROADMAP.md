@@ -101,3 +101,28 @@ temporal offsets) while `tc-server` owns the actual transport.
    methods planned in `client/py` and `client/js` (e.g., `media.stream(offset=...)`).
 5. **Testing.** Add unit/integration tests that exercise temporal seeks, range
    calculations, and queue-resumed ingestion without involving network transports.
+
+## Phase 4 – Tensor API ownership handoff (v1 alignment)
+
+Goal: remove long-term Tensor routing/API ownership from `tc-state` and move it
+to `tc-collection`, where the final transactional Tensor type lives.
+
+1. **Freeze `tc-state` Tensor surface as transitional.** Keep the current
+   in-memory Tensor facade only as a compatibility shim while transactional
+   Tensor implementation lands in `tc-collection`.
+2. **Move canonical Tensor route semantics.** Define and own Tensor route
+   methods (`shape`, `dtype`, `size`, `reshape`, `broadcast`, `expand_dims`,
+   `transpose`, `slice`, reductions, and binary ops) in `tc-collection` APIs,
+   not in `tc-state`.
+3. **Server dependency flip.** Update `tc-server` so Tensor op resolution calls
+   `tc-collection` interfaces for authoritative behavior. `tc-state` remains a
+   fallback/testing shim until removed.
+4. **Deprecation and removal plan.** Mark `tc-state` Tensor routing helpers as
+   transitional, add migration notes, then delete duplicated route logic after
+   `tc-collection` parity and recovery gates are green.
+5. **Exit criteria.**
+   - `tc-server` Tensor routing no longer depends on `tc-state` Tensor APIs for
+     canonical behavior.
+   - Transactional Tensor behavior is owned and tested in `tc-collection`.
+   - `tc-state` keeps only minimal compatibility scaffolding (or no Tensor
+     routing helpers once migration is complete).
