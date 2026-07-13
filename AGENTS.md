@@ -14,3 +14,10 @@
 - Encode/decode state exclusively with `destream` unless a protocol forces a
   tiny, bounded payload (e.g., query parameters). If you must reach for `serde`
   in those edge cases, document the reason inline.
+- When encoding or decoding collection state, keep BTree payload handling
+  stream-first end-to-end. Do not call APIs that materialize full key vectors
+  (`Vec`) in production serialization/deserialization paths.
+- Do not construct `freqfs::Cache` in production `tc-state` module code.
+  BTree decode paths must receive preloaded roots via bootstrap-owned context
+  injection (`StateContext::with_btree_roots(...)`). Any cache construction in
+  this crate must be limited to `#[cfg(test)]` helpers.

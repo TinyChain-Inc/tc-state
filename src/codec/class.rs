@@ -2,11 +2,13 @@ use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
 use tc_ir::{Class, NativeClass};
 use tc_value::ValueType;
 
+const STATE_COLLECTION_BTREE_PATH: PathLabel = path_label(&["state", "collection", "btree"]);
 const STATE_COLLECTION_TENSOR_PATH: PathLabel = path_label(&["state", "collection", "tensor"]);
 const STATE_SCALAR_TUPLE_PATH: PathLabel = path_label(&["state", "scalar", "tuple"]);
 
 const LABEL_STATE: Label = label("state");
 const LABEL_COLLECTION: Label = label("collection");
+const LABEL_BTREE: Label = label("btree");
 const LABEL_SCALAR: Label = label("scalar");
 const LABEL_TENSOR: Label = label("tensor");
 const LABEL_TUPLE: Label = label("tuple");
@@ -61,6 +63,7 @@ impl From<CollectionType> for StateType {
 /// Transitional collection classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionType {
+    BTree(BTreeType),
     Tensor(TensorType),
 }
 
@@ -68,13 +71,24 @@ impl Class for CollectionType {}
 
 impl NativeClass for CollectionType {
     fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if let Some(btree) = BTreeType::from_path(path) {
+            return Some(Self::BTree(btree));
+        }
+
         TensorType::from_path(path).map(Self::Tensor)
     }
 
     fn path(&self) -> PathBuf {
         match self {
+            Self::BTree(btree) => btree.path(),
             Self::Tensor(tensor) => tensor.path(),
         }
+    }
+}
+
+impl From<BTreeType> for CollectionType {
+    fn from(btree_type: BTreeType) -> Self {
+        CollectionType::BTree(btree_type)
     }
 }
 
@@ -107,6 +121,29 @@ impl NativeClass for TensorType {
     }
 }
 
+/// Transitional btree class (single variant for now).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BTreeType;
+
+impl Class for BTreeType {}
+
+impl NativeClass for BTreeType {
+    fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if path_matches(path, &STATE_COLLECTION_BTREE_PATH) {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        PathBuf::new()
+            .append(LABEL_STATE)
+            .append(LABEL_COLLECTION)
+            .append(LABEL_BTREE)
+    }
+}
+
 fn path_matches(path: &[PathSegment], expected: &PathLabel) -> bool {
     path.len() == expected[..].len()
         && path
@@ -134,6 +171,18 @@ mod tests {
         assert_eq!(
             StateType::from_path(canonical.as_ref()),
             Some(StateType::Tuple)
+        );
+    }
+
+    #[test]
+    fn accepts_canonical_btree_collection_path() {
+        let canonical = "/state/collection/btree"
+            .parse::<PathBuf>()
+            .expect("canonical btree path");
+
+        assert_eq!(
+            StateType::from_path(canonical.as_ref()),
+            Some(StateType::Collection(CollectionType::BTree(BTreeType)))
         );
     }
 }
