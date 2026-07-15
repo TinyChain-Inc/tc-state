@@ -18,4 +18,6 @@ umask = "2.1"
 
 [dev-dependencies]
 bytes = "1"
+destream_json = { path = "../deps/destream_json" }
+futures = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "fs", "macros"] }

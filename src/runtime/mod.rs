@@ -1,10 +1,13 @@
-//! Transitional TinyChain state primitives.
+//! Transitional TinyChain state runtime primitives.
 //!
-//! This crate exposes the placeholder collection and scalar state enums used by
-//! adapters that need to exchange TinyChain values before the full transactional
-//! filesystem (`freqfs`) + `Chain` + `Service` stack lands. The in-memory tensor
-//! representation keeps downstream crates unblocked while we finish the shared
-//! persistence layer.
+//! This module provides a lightweight runtime surface for scalar/collection state
+//! values used by adapters while the broader transactional runtime continues to
+//! evolve.
+//!
+//! BTree decode is bootstrap-wired: production code injects preloaded
+//! `freqfs::DirLock` roots into `StateContext::with_btree_roots(...)` and decode
+//! paths consume those handles. This crate does not construct `freqfs::Cache` in
+//! production runtime code.
 
 use std::{str::FromStr, sync::Arc};
 
@@ -331,6 +334,7 @@ pub enum State {
     Collection(Collection),
 }
 
+
 impl State {
     pub fn is_none(&self) -> bool {
         match self {
@@ -377,3 +381,6 @@ impl From<Number> for State {
         State::from(Value::from(number))
     }
 }
+
+#[cfg(test)]
+mod tests;
