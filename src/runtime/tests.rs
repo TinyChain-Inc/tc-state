@@ -5,10 +5,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 use destream::{de, en};
 use futures::{stream, TryStreamExt};
+use number_general::{FloatType, UIntType};
 use safecast::CastInto;
 use tc_collection::btree::PersistentFile;
 use tc_ir::{Map, Scalar};
-use tc_value::Value;
+use tc_value::{NumberType, Value, ValueType};
 
 use super::*;
 
@@ -64,6 +65,28 @@ fn load_btree_roots(
         .expect("load txn root");
 
     (persistent, txn)
+}
+
+fn run_async_with_large_stack(
+    name: &str,
+    test_fn: impl FnOnce() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    + Send
+    + 'static,
+) {
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("create test runtime");
+
+            runtime.block_on(test_fn());
+        })
+        .expect("spawn test thread")
+        .join()
+        .expect("join test thread");
 }
 
 #[tokio::test]
@@ -152,6 +175,104 @@ fn tensor_facade_read_write_value_roundtrip() {
 }
 
 #[tokio::test]
+async fn tensor_f64_direct_round_trip() {
+    let tensor = Tensor::dense_f64(vec![2, 2], vec![1.5, 2.5, 3.5, 4.5]).expect("tensor");
+
+    let encoded = encode_json(tensor).await;
+    let decoded: Tensor = decode_json(null_transaction(), encoded)
+        .await
+        .expect("decode tensor");
+
+    assert_eq!(decoded.shape(), &[2, 2]);
+    assert_eq!(decoded.flattened_f64().expect("f64 values"), vec![1.5, 2.5, 3.5, 4.5]);
+}
+
+#[tokio::test]
+async fn tensor_u64_direct_round_trip() {
+    let tensor = Tensor::dense_u64(vec![2, 2], vec![1, 2, 3, 4]).expect("tensor");
+
+    let encoded = encode_json(tensor).await;
+    let decoded: Tensor = decode_json(null_transaction(), encoded)
+        .await
+        .expect("decode tensor");
+
+    assert_eq!(decoded.shape(), &[2, 2]);
+    assert_eq!(decoded.flattened_u64().expect("u64 values"), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn tensor_facade_cast_roundtrip() {
+    let tensor = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("tensor");
+
+    let as_f64 = tensor
+        .clone()
+        .cast(NumberType::Float(FloatType::F64))
+        .expect("cast f64");
+    assert_eq!(as_f64.flattened_f64().expect("f64 values"), vec![1.0, 2.0, 3.0, 4.0]);
+
+    let as_u64 = tensor
+        .cast(NumberType::UInt(UIntType::U64))
+        .expect("cast u64");
+    assert_eq!(as_u64.flattened_u64().expect("u64 values"), vec![1, 2, 3, 4]);
+}
+
+#[test]
+fn tensor_facade_reduce_and_reduce_axes() {
+    let tensor = Tensor::dense_f32(vec![2, 2], vec![1.0, 2.0, 3.0, 4.0]).expect("tensor");
+
+    let sum: f64 = tensor.reduce("sum").expect("reduce sum").cast_into();
+    assert_eq!(sum, 10.0);
+
+    let reduced = tensor
+        .reduce_axes("sum", Some(vec![1]), false)
+        .expect("reduce axis 1");
+    let TensorReduceResult::Tensor(reduced) = reduced else {
+        panic!("expected tensor reduction output");
+    };
+
+    assert_eq!(reduced.shape(), &[2]);
+    assert_eq!(reduced.flattened_f32().expect("reduced values"), vec![3.0, 7.0]);
+}
+
+#[test]
+fn tensor_facade_broadcast_roundtrip() {
+    let tensor = Tensor::dense_f32(vec![2, 1], vec![1.0, 2.0]).expect("tensor");
+    let broadcast = tensor.broadcast(vec![2, 3]).expect("broadcast");
+
+    assert_eq!(broadcast.shape(), &[2, 3]);
+    assert_eq!(
+        broadcast.flattened_f32().expect("broadcast values"),
+        vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]
+    );
+}
+
+#[test]
+fn tensor_facade_matmul_roundtrip() {
+    let left = Tensor::dense_f32(vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("left");
+    let right =
+        Tensor::dense_f32(vec![3, 2], vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).expect("right");
+
+    let product = left.matmul(&right).expect("matmul");
+    assert_eq!(product.shape(), &[2, 2]);
+    assert_eq!(
+        product.flattened_f32().expect("matmul values"),
+        vec![58.0, 64.0, 139.0, 154.0]
+    );
+}
+
+#[test]
+fn tensor_facade_slice_roundtrip() {
+    let tensor = Tensor::dense_u64(vec![2, 3], vec![1, 2, 3, 4, 5, 6]).expect("tensor");
+    let range: Range = vec![AxisRange::from(0..2), AxisRange::from(1..3)]
+        .into_iter()
+        .collect();
+
+    let sliced = tensor.slice(range).expect("slice");
+    assert_eq!(sliced.shape(), &[2, 2]);
+    assert_eq!(sliced.flattened_u64().expect("slice values"), vec![2, 3, 5, 6]);
+}
+
+#[tokio::test]
 async fn btree_decode_fails_clearly_without_roots() {
     let payload = br#"{"/state/collection/btree":null}"#.to_vec();
     let err = decode_json::<State>(state_context(null_transaction()), payload)
@@ -180,6 +301,38 @@ async fn btree_decode_path_uses_provided_roots() {
             "decode should move past missing-roots failure when roots are provided: {err}"
         );
     }
+}
+
+#[test]
+fn btree_decode_valid_payload_succeeds_with_roots() {
+    run_async_with_large_stack("tc-state-btree-valid-payload", || {
+        Box::pin(async move {
+            let root = unique_test_root("btree-valid-payload");
+            std::fs::create_dir_all(&root).expect("create temp root");
+            let (persistent, txn_root) = load_btree_roots(&root);
+
+            let decode_txn = null_transaction();
+            let context =
+                state_context(Arc::clone(&decode_txn)).with_btree_roots(persistent, txn_root);
+            let payload =
+                br#"{"/state/collection/btree":[[["id","/state/scalar/value/number"]],[1,2,3]]}"#
+                    .to_vec();
+
+            let decoded: State = decode_json(context, payload).await.expect("decode btree state");
+
+            let State::Collection(Collection::BTree(btree)) = decoded else {
+                panic!("expected decoded BTree collection state");
+            };
+
+            assert_eq!(btree.schema.len(), 1);
+            assert_eq!(btree.schema[0].name, "id");
+            assert_eq!(btree.schema[0].dtype, ValueType::Number);
+
+            // Successful decode with schema materialization proves the bootstrap-root decode path
+            // accepted a valid [schema, rows] BTree payload.
+            assert_eq!(btree.schema[0].max_size, None);
+        })
+    });
 }
 
 #[test]
