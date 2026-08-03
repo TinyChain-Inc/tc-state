@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+b-tree = { path = "../deps/b-tree" }
 destream = { path = "../deps/destream", version = "0.10" }
 freqfs = { path = "../deps/freqfs", version = "0.13" }
 ha-ndarray = { path = "../deps/ha-ndarray", version = "0.5" }
