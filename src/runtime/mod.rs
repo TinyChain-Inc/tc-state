@@ -9,7 +9,7 @@
 //! paths consume those handles. This crate does not construct `freqfs::Cache` in
 //! production runtime code.
 
-use std::{str::FromStr, sync::Arc};
+use std::{ops::Bound, str::FromStr, sync::Arc};
 
 use destream::{
     de,
@@ -54,7 +54,7 @@ pub enum TensorReduceResult {
 #[derive(Clone, Debug)]
 pub enum Collection {
     /// Transitional in-memory BTree data with explicit v1-style column schema.
-    BTree(BTreeCollection),
+    BTree(Box<BTreeCollection>),
     /// Tensor data stored entirely in memory. Variants cover f32 and u64 element types.
     Tensor(Tensor),
 }
@@ -63,11 +63,78 @@ pub enum Collection {
 pub struct BTreeCollection {
     pub schema: Vec<BTreeColumnSchema>,
     pub btree: BTree,
+    pub bounds: (Bound<Value>, Bound<Value>),
+    pub reverse: bool,
 }
 
 impl BTreeCollection {
     pub fn with_schema(schema: Vec<BTreeColumnSchema>, btree: BTree) -> Self {
-        Self { schema, btree }
+        Self {
+            schema,
+            btree,
+            bounds: (Bound::Unbounded, Bound::Unbounded),
+            reverse: false,
+        }
+    }
+
+    pub fn slice(&self, bounds: (Bound<Value>, Bound<Value>), reverse: bool) -> Self {
+        Self {
+            schema: self.schema.clone(),
+            btree: self.btree.clone(),
+            bounds: (
+                max_lower_bound(self.bounds.0.clone(), bounds.0),
+                min_upper_bound(self.bounds.1.clone(), bounds.1),
+            ),
+            reverse,
+        }
+    }
+
+    pub async fn finalized_key_stream(&self) -> std::io::Result<b_tree::Keys<Value>> {
+        self.btree
+            .finalized_key_stream_in(self.bounds.clone(), self.reverse)
+            .await
+    }
+}
+
+impl From<BTreeCollection> for Collection {
+    fn from(btree: BTreeCollection) -> Self {
+        Self::BTree(Box::new(btree))
+    }
+}
+
+fn max_lower_bound(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (Bound::Included(left), Bound::Included(right)) => {
+            if left >= right { Bound::Included(left) } else { Bound::Included(right) }
+        }
+        (Bound::Included(left), Bound::Excluded(right)) => {
+            if left > right { Bound::Included(left) } else { Bound::Excluded(right) }
+        }
+        (Bound::Excluded(left), Bound::Included(right)) => {
+            if left < right { Bound::Included(right) } else { Bound::Excluded(left) }
+        }
+        (Bound::Excluded(left), Bound::Excluded(right)) => {
+            if left >= right { Bound::Excluded(left) } else { Bound::Excluded(right) }
+        }
+    }
+}
+
+fn min_upper_bound(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
+    match (left, right) {
+        (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
+        (Bound::Included(left), Bound::Included(right)) => {
+            if left <= right { Bound::Included(left) } else { Bound::Included(right) }
+        }
+        (Bound::Included(left), Bound::Excluded(right)) => {
+            if left < right { Bound::Included(left) } else { Bound::Excluded(right) }
+        }
+        (Bound::Excluded(left), Bound::Included(right)) => {
+            if left <= right { Bound::Excluded(left) } else { Bound::Included(right) }
+        }
+        (Bound::Excluded(left), Bound::Excluded(right)) => {
+            if left <= right { Bound::Excluded(left) } else { Bound::Excluded(right) }
+        }
     }
 }
 
@@ -306,11 +373,7 @@ impl StateContext {
             "BTree decode requires StateContext::with_btree_roots(...) at bootstrap".to_string()
         })?;
 
-        Ok(BTreeDecodeContext::new(
-            persistent_dir,
-            txn_root,
-            self.transaction().id(),
-        ))
+        Ok(BTreeDecodeContext::new(persistent_dir, txn_root))
     }
 }
 
@@ -355,6 +418,42 @@ impl Default for State {
 impl From<Value> for State {
     fn from(value: Value) -> Self {
         State::Scalar(Scalar::from(value))
+    }
+}
+
+impl TryCastFrom<State> for Value {
+    fn can_cast_from(state: &State) -> bool {
+        matches!(state, State::Scalar(Scalar::Value(_)))
+    }
+
+    fn opt_cast_from(state: State) -> Option<Self> {
+        match state {
+            State::Scalar(Scalar::Value(value)) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+impl TryCastFrom<State> for Vec<Value> {
+    fn can_cast_from(state: &State) -> bool {
+        match state {
+            State::Tuple(items) => items.iter().all(Value::can_cast_from),
+            State::Scalar(Scalar::Tuple(items)) => items
+                .iter()
+                .all(|item| matches!(item, Scalar::Value(_))),
+            state => Value::can_cast_from(state),
+        }
+    }
+
+    fn opt_cast_from(state: State) -> Option<Self> {
+        match state {
+            State::Tuple(items) => items.into_iter().map(Value::opt_cast_from).collect(),
+            State::Scalar(Scalar::Tuple(items)) => items
+                .into_iter()
+                .map(|item| Value::opt_cast_from(State::Scalar(item)))
+                .collect(),
+            state => Some(vec![Value::opt_cast_from(state)?]),
+        }
     }
 }
 
