@@ -1,19 +1,21 @@
-use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
+use pathlink::{Label, PathBuf, PathLabel, PathSegment, label, path_label};
 use tc_ir::{Class, NativeClass};
 use tc_value::ValueType;
 
 const STATE_COLLECTION_BTREE_PATH: PathLabel = path_label(&["state", "collection", "btree"]);
+const STATE_COLLECTION_TABLE_PATH: PathLabel = path_label(&["state", "collection", "table"]);
 const STATE_COLLECTION_TENSOR_PATH: PathLabel = path_label(&["state", "collection", "tensor"]);
 const STATE_SCALAR_TUPLE_PATH: PathLabel = path_label(&["state", "scalar", "tuple"]);
 
 const LABEL_STATE: Label = label("state");
 const LABEL_COLLECTION: Label = label("collection");
 const LABEL_BTREE: Label = label("btree");
+const LABEL_TABLE: Label = label("table");
 const LABEL_SCALAR: Label = label("scalar");
 const LABEL_TENSOR: Label = label("tensor");
 const LABEL_TUPLE: Label = label("tuple");
 
-/// Transitional TinyChain state classes.
+/// TinyChain state classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StateType {
     Scalar(ValueType),
@@ -60,10 +62,11 @@ impl From<CollectionType> for StateType {
     }
 }
 
-/// Transitional collection classes.
+/// TinyChain collection classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CollectionType {
     BTree(BTreeType),
+    Table(TableType),
     Tensor(TensorType),
 }
 
@@ -75,12 +78,17 @@ impl NativeClass for CollectionType {
             return Some(Self::BTree(btree));
         }
 
+        if let Some(table) = TableType::from_path(path) {
+            return Some(Self::Table(table));
+        }
+
         TensorType::from_path(path).map(Self::Tensor)
     }
 
     fn path(&self) -> PathBuf {
         match self {
             Self::BTree(btree) => btree.path(),
+            Self::Table(table) => table.path(),
             Self::Tensor(tensor) => tensor.path(),
         }
     }
@@ -92,13 +100,19 @@ impl From<BTreeType> for CollectionType {
     }
 }
 
+impl From<TableType> for CollectionType {
+    fn from(table_type: TableType) -> Self {
+        CollectionType::Table(table_type)
+    }
+}
+
 impl From<TensorType> for CollectionType {
     fn from(tensor_type: TensorType) -> Self {
         CollectionType::Tensor(tensor_type)
     }
 }
 
-/// Transitional tensor class (single variant for now).
+/// Tensor collection class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TensorType;
 
@@ -121,7 +135,30 @@ impl NativeClass for TensorType {
     }
 }
 
-/// Transitional btree class (single variant for now).
+/// The canonical Table collection class.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TableType;
+
+impl Class for TableType {}
+
+impl NativeClass for TableType {
+    fn from_path(path: &[PathSegment]) -> Option<Self> {
+        if path_matches(path, &STATE_COLLECTION_TABLE_PATH) {
+            Some(Self)
+        } else {
+            None
+        }
+    }
+
+    fn path(&self) -> PathBuf {
+        PathBuf::new()
+            .append(LABEL_STATE)
+            .append(LABEL_COLLECTION)
+            .append(LABEL_TABLE)
+    }
+}
+
+/// BTree collection class.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BTreeType;
 

@@ -5,8 +5,8 @@ use tc_ir::NativeClass;
 use tc_ir::{Map, Scalar};
 use tc_value::Value;
 
-use super::helpers::{decode_op_def_entry, decode_value_entry, drain_remaining_entries};
 use super::class::{CollectionType, StateType};
+use super::helpers::{decode_op_def_entry, decode_value_entry, drain_remaining_entries};
 use super::parse::{parse_state_map_id, parse_state_path};
 use crate::runtime::{BTreeCollection, Collection, State, StateContext, Tensor};
 
@@ -162,22 +162,25 @@ impl de::FromStream for State {
                     StateType::Collection(CollectionType::BTree(_)) => {
                         let decode_context = self
                             .context
-                            .btree_decode_context()
+                            .state_decode_context()
                             .map_err(de::Error::custom)?;
                         let payload = map
                             .next_value::<DecodedBTreePayload>(decode_context)
                             .await?;
                         drain_remaining_entries(&mut map).await?;
 
-                        Ok(State::Collection(Collection::BTree(
+                        Ok(State::Collection(Collection::from(
                             BTreeCollection::with_schema(payload.schema, payload.btree),
                         )))
                     }
                     StateType::Collection(CollectionType::Tensor(_)) => {
-                        let tensor = map.next_value::<Tensor>(self.context.transaction()).await?;
+                        let tensor = map.next_value::<Tensor>(()).await?;
                         drain_remaining_entries(&mut map).await?;
                         Ok(State::Collection(Collection::Tensor(tensor)))
                     }
+                    StateType::Collection(CollectionType::Table(_)) => Err(de::Error::custom(
+                        "Table decode requires a host collection root and is not available in StateContext",
+                    )),
                     StateType::Scalar(value_type) => {
                         let value = decode_value_entry(value_type, &mut map).await?;
                         drain_remaining_entries(&mut map).await?;

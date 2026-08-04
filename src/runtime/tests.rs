@@ -4,10 +4,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use destream::{de, en};
-use futures::{stream, TryStreamExt};
+use futures::{TryStreamExt, stream};
 use number_general::{FloatType, UIntType};
-use safecast::CastInto;
-use tc_collection::btree::PersistentFile;
+use safecast::{CastInto, TryCastFrom};
+use tc_collection::{
+    btree::{PersistentFile, StorageConfig},
+    table::{Column, PersistentTable, Table, TableSchema},
+};
 use tc_ir::{Map, Scalar};
 use tc_value::{NumberType, Value, ValueType};
 
@@ -45,6 +48,88 @@ fn unique_test_root(label: &str) -> PathBuf {
         .as_nanos();
 
     std::env::temp_dir().join(format!("tc-state-{label}-{nanos}"))
+}
+
+#[test]
+fn state_casts_to_value_and_value_vector() {
+    let value = Value::try_cast_from(State::from(Value::from(7_u64)), |_| "invalid value")
+        .expect("cast scalar state to value");
+    assert_eq!(value, Value::from(7_u64));
+
+    let values = Vec::<Value>::try_cast_from(
+        State::Tuple(vec![
+            State::from(Value::from(1_u64)),
+            State::from(Value::from(2_u64)),
+        ]),
+        |_| "invalid row",
+    )
+    .expect("cast tuple state to value vector");
+    assert_eq!(values, vec![Value::from(1_u64), Value::from(2_u64)]);
+
+    assert!(Value::opt_cast_from(State::Tuple(vec![])).is_none());
+}
+
+#[test]
+fn table_get_streams_a_transactional_view() {
+    run_async_with_large_stack("tc-state-table-stream", || {
+        Box::pin(async move {
+            let root = unique_test_root("table-stream");
+            std::fs::create_dir_all(&root).expect("create temp root");
+            let (persistent, txn_root) = load_btree_roots(&root);
+            let schema = TableSchema::new(
+                vec![Column {
+                    name: "id".parse().expect("id"),
+                    dtype: ValueType::Number,
+                }],
+                vec![Column {
+                    name: "label".parse().expect("label"),
+                    dtype: ValueType::String,
+                }],
+                Vec::new(),
+                StorageConfig::default(),
+            )
+            .expect("table schema");
+            let table = PersistentTable::new(persistent, txn_root, schema);
+            let txn = null_transaction();
+            table
+                .upsert_row(
+                    txn.id(),
+                    vec![Value::from(1_u64)],
+                    vec![Value::from("first")],
+                )
+                .await
+                .expect("insert table row");
+
+            let state = State::from(Table::from(table));
+            let response = state
+                .get(&[], State::None, txn.as_ref())
+                .await
+                .expect("table get")
+                .expect("table response");
+            let StateStream::Map(entries) = response
+                .into_result_stream()
+                .await
+                .expect("table result stream")
+            else {
+                panic!("expected a typed table result stream");
+            };
+            assert_eq!(entries.len(), 1);
+            let (_, StateStream::Tuple(parts)) = entries.into_iter().next().expect("table entry")
+            else {
+                panic!("expected table schema and row sequence");
+            };
+            let StateStream::Sequence(rows) = parts.into_iter().nth(1).expect("row sequence")
+            else {
+                panic!("expected table row sequence");
+            };
+            let rows = rows.try_collect::<Vec<_>>().await.expect("stream rows");
+            assert_eq!(rows.len(), 1);
+            assert!(matches!(
+                &rows[0],
+                State::Scalar(Scalar::Value(Value::Tuple(values))) if values == &vec![Value::from(1_u64), Value::from("first")]
+            ));
+        })
+    });
 }
 
 fn load_btree_roots(
@@ -113,7 +198,7 @@ async fn tensor_round_trip() {
         .expect("decode state");
 
     match decoded {
-        State::Collection(Collection::Tensor(Tensor::F32(buf))) => assert_eq!(buf.size(), 4),
+        State::Collection(Collection::Tensor(tensor)) => assert_eq!(tensor.size(), 4),
         other => panic!("unexpected state {other:?}"),
     }
 }
@@ -179,12 +264,13 @@ async fn tensor_f64_direct_round_trip() {
     let tensor = Tensor::dense_f64(vec![2, 2], vec![1.5, 2.5, 3.5, 4.5]).expect("tensor");
 
     let encoded = encode_json(tensor).await;
-    let decoded: Tensor = decode_json(null_transaction(), encoded)
-        .await
-        .expect("decode tensor");
+    let decoded: Tensor = decode_json((), encoded).await.expect("decode tensor");
 
     assert_eq!(decoded.shape(), &[2, 2]);
-    assert_eq!(decoded.flattened_f64().expect("f64 values"), vec![1.5, 2.5, 3.5, 4.5]);
+    assert_eq!(
+        decoded.flattened_f64().expect("f64 values"),
+        vec![1.5, 2.5, 3.5, 4.5]
+    );
 }
 
 #[tokio::test]
@@ -192,12 +278,13 @@ async fn tensor_u64_direct_round_trip() {
     let tensor = Tensor::dense_u64(vec![2, 2], vec![1, 2, 3, 4]).expect("tensor");
 
     let encoded = encode_json(tensor).await;
-    let decoded: Tensor = decode_json(null_transaction(), encoded)
-        .await
-        .expect("decode tensor");
+    let decoded: Tensor = decode_json((), encoded).await.expect("decode tensor");
 
     assert_eq!(decoded.shape(), &[2, 2]);
-    assert_eq!(decoded.flattened_u64().expect("u64 values"), vec![1, 2, 3, 4]);
+    assert_eq!(
+        decoded.flattened_u64().expect("u64 values"),
+        vec![1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -208,12 +295,18 @@ fn tensor_facade_cast_roundtrip() {
         .clone()
         .cast(NumberType::Float(FloatType::F64))
         .expect("cast f64");
-    assert_eq!(as_f64.flattened_f64().expect("f64 values"), vec![1.0, 2.0, 3.0, 4.0]);
+    assert_eq!(
+        as_f64.flattened_f64().expect("f64 values"),
+        vec![1.0, 2.0, 3.0, 4.0]
+    );
 
     let as_u64 = tensor
         .cast(NumberType::UInt(UIntType::U64))
         .expect("cast u64");
-    assert_eq!(as_u64.flattened_u64().expect("u64 values"), vec![1, 2, 3, 4]);
+    assert_eq!(
+        as_u64.flattened_u64().expect("u64 values"),
+        vec![1, 2, 3, 4]
+    );
 }
 
 #[test]
@@ -231,7 +324,10 @@ fn tensor_facade_reduce_and_reduce_axes() {
     };
 
     assert_eq!(reduced.shape(), &[2]);
-    assert_eq!(reduced.flattened_f32().expect("reduced values"), vec![3.0, 7.0]);
+    assert_eq!(
+        reduced.flattened_f32().expect("reduced values"),
+        vec![3.0, 7.0]
+    );
 }
 
 #[test]
@@ -269,7 +365,10 @@ fn tensor_facade_slice_roundtrip() {
 
     let sliced = tensor.slice(range).expect("slice");
     assert_eq!(sliced.shape(), &[2, 2]);
-    assert_eq!(sliced.flattened_u64().expect("slice values"), vec![2, 3, 5, 6]);
+    assert_eq!(
+        sliced.flattened_u64().expect("slice values"),
+        vec![2, 3, 5, 6]
+    );
 }
 
 #[tokio::test]
@@ -280,7 +379,7 @@ async fn btree_decode_fails_clearly_without_roots() {
         .expect_err("decode should fail without btree roots");
 
     assert!(
-        err.contains("StateContext::with_btree_roots"),
+        err.contains("StateContext::with_state_roots"),
         "unexpected error: {err}"
     );
 }
@@ -291,13 +390,13 @@ async fn btree_decode_path_uses_provided_roots() {
     std::fs::create_dir_all(&root).expect("create temp root");
     let (persistent, txn_root) = load_btree_roots(&root);
 
-    let context = state_context(null_transaction()).with_btree_roots(persistent, txn_root);
+    let context = state_context(null_transaction()).with_state_roots(persistent, txn_root);
     let payload = br#"{"/state/collection/btree":null}"#.to_vec();
     let result = decode_json::<State>(context, payload).await;
 
     if let Err(err) = result {
         assert!(
-            !err.contains("StateContext::with_btree_roots"),
+            !err.contains("StateContext::with_state_roots"),
             "decode should move past missing-roots failure when roots are provided: {err}"
         );
     }
@@ -313,12 +412,14 @@ fn btree_decode_valid_payload_succeeds_with_roots() {
 
             let decode_txn = null_transaction();
             let context =
-                state_context(Arc::clone(&decode_txn)).with_btree_roots(persistent, txn_root);
+                state_context(Arc::clone(&decode_txn)).with_state_roots(persistent, txn_root);
             let payload =
                 br#"{"/state/collection/btree":[[["id","/state/scalar/value/number"]],[1,2,3]]}"#
                     .to_vec();
 
-            let decoded: State = decode_json(context, payload).await.expect("decode btree state");
+            let decoded: State = decode_json(context, payload)
+                .await
+                .expect("decode btree state");
 
             let State::Collection(Collection::BTree(btree)) = decoded else {
                 panic!("expected decoded BTree collection state");
@@ -345,7 +446,7 @@ fn production_sources_do_not_construct_freqfs_cache() {
         ("src/codec/mod.rs", include_str!("../codec/mod.rs")),
         ("src/codec/parse.rs", include_str!("../codec/parse.rs")),
         ("src/runtime/mod.rs", include_str!("mod.rs")),
-        ("src/runtime/tensor.rs", include_str!("tensor.rs")),
+        ("src/runtime/ops.rs", include_str!("ops.rs")),
     ];
 
     for (path, source) in SOURCES {

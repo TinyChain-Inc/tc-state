@@ -1,61 +1,42 @@
-//! Transitional TinyChain state runtime primitives.
-//!
-//! This module provides a lightweight runtime surface for scalar/collection state
-//! values used by adapters while the broader transactional runtime continues to
-//! evolve.
+//! TinyChain state runtime primitives.
 //!
 //! BTree decode is bootstrap-wired: production code injects preloaded
-//! `freqfs::DirLock` roots into `StateContext::with_btree_roots(...)` and decode
+//! `freqfs::DirLock` roots into `StateContext::with_state_roots(...)` and decode
 //! paths consume those handles. This crate does not construct `freqfs::Cache` in
 //! production runtime code.
 
 use std::{ops::Bound, str::FromStr, sync::Arc};
 
 use destream::{
-    de,
-    en::{self, EncodeMap, EncodeSeq, Error as _},
     IntoStream,
+    en::{self, EncodeMap, Error as _},
 };
-use ha_ndarray::{ArrayBuf, Buffer, NDArray, NDArrayRead};
-use number_general::{FloatType, Number, UIntType};
+use number_general::Number;
 use pathlink::Link;
 use safecast::TryCastFrom;
-use tc_collection::btree::{BTree, BTreeColumnSchema, BTreeDecodeContext, PersistentFile};
+use tc_collection::{
+    btree::{BTree, BTreeColumnSchema, BTreeDecodeContext, PersistentFile},
+    table::Table,
+};
 use tc_ir::{Claim, Map, NetworkTime, Scalar, Transaction, TxnId};
-use tc_value::{number_type_path, NumberType, Value};
+use tc_value::Value;
 
-mod tensor;
-mod wire;
+mod ops;
 
-use wire::{coerce_shape, tensor_dtype_from_wire, tensor_from_parts};
+pub use ops::StateStream;
 
-pub use crate::codec::{BTreeType, CollectionType, StateType, TensorType};
-pub use ha_ndarray::{AxisRange, Range};
+pub use crate::codec::{BTreeType, CollectionType, StateType, TableType, TensorType};
+pub use tc_collection::tensor::{AxisRange, Range, Tensor, TensorReduceResult};
 pub use tc_ir::{Class, NativeClass};
 
-/// Temporary tensor representation (in-memory only).
-#[derive(Clone, Debug)]
-pub enum Tensor {
-    /// 32-bit floating point tensor.
-    F32(Box<ArrayBuf<f32, Buffer<f32>>>),
-    /// 64-bit floating point tensor.
-    F64(Box<ArrayBuf<f64, Buffer<f64>>>),
-    /// 64-bit unsigned integer tensor.
-    U64(Box<ArrayBuf<u64, Buffer<u64>>>),
-}
-
-#[derive(Clone, Debug)]
-pub enum TensorReduceResult {
-    Scalar(Number),
-    Tensor(Tensor),
-}
-
-/// Temporary collection enum.
+/// Collection state.
 #[derive(Clone, Debug)]
 pub enum Collection {
-    /// Transitional in-memory BTree data with explicit v1-style column schema.
+    /// In-memory BTree data with an explicit column schema.
     BTree(Box<BTreeCollection>),
-    /// Tensor data stored entirely in memory. Variants cover f32 and u64 element types.
+    /// A relational table or a lazy table view.
+    Table(Box<TableCollection>),
+    /// In-memory Tensor data.
     Tensor(Tensor),
 }
 
@@ -65,6 +46,27 @@ pub struct BTreeCollection {
     pub btree: BTree,
     pub bounds: (Bound<Value>, Bound<Value>),
     pub reverse: bool,
+}
+
+/// A Table together with the snapshot used to produce a routed view.
+#[derive(Clone, Debug)]
+pub struct TableCollection {
+    pub table: Table,
+    pub txn_id: Option<TxnId>,
+}
+
+impl TableCollection {
+    pub fn new(table: Table) -> Self {
+        Self {
+            table,
+            txn_id: None,
+        }
+    }
+
+    pub fn with_txn(mut self, txn_id: TxnId) -> Self {
+        self.txn_id = Some(txn_id);
+        self
+    }
 }
 
 impl BTreeCollection {
@@ -102,20 +104,42 @@ impl From<BTreeCollection> for Collection {
     }
 }
 
+impl From<Table> for Collection {
+    fn from(table: Table) -> Self {
+        Self::Table(Box::new(TableCollection::new(table)))
+    }
+}
+
 fn max_lower_bound(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
     match (left, right) {
         (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
         (Bound::Included(left), Bound::Included(right)) => {
-            if left >= right { Bound::Included(left) } else { Bound::Included(right) }
+            if left >= right {
+                Bound::Included(left)
+            } else {
+                Bound::Included(right)
+            }
         }
         (Bound::Included(left), Bound::Excluded(right)) => {
-            if left > right { Bound::Included(left) } else { Bound::Excluded(right) }
+            if left > right {
+                Bound::Included(left)
+            } else {
+                Bound::Excluded(right)
+            }
         }
         (Bound::Excluded(left), Bound::Included(right)) => {
-            if left < right { Bound::Included(right) } else { Bound::Excluded(left) }
+            if left < right {
+                Bound::Included(right)
+            } else {
+                Bound::Excluded(left)
+            }
         }
         (Bound::Excluded(left), Bound::Excluded(right)) => {
-            if left >= right { Bound::Excluded(left) } else { Bound::Excluded(right) }
+            if left >= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Excluded(right)
+            }
         }
     }
 }
@@ -124,29 +148,33 @@ fn min_upper_bound(left: Bound<Value>, right: Bound<Value>) -> Bound<Value> {
     match (left, right) {
         (Bound::Unbounded, bound) | (bound, Bound::Unbounded) => bound,
         (Bound::Included(left), Bound::Included(right)) => {
-            if left <= right { Bound::Included(left) } else { Bound::Included(right) }
+            if left <= right {
+                Bound::Included(left)
+            } else {
+                Bound::Included(right)
+            }
         }
         (Bound::Included(left), Bound::Excluded(right)) => {
-            if left < right { Bound::Included(left) } else { Bound::Excluded(right) }
+            if left < right {
+                Bound::Included(left)
+            } else {
+                Bound::Excluded(right)
+            }
         }
         (Bound::Excluded(left), Bound::Included(right)) => {
-            if left <= right { Bound::Excluded(left) } else { Bound::Included(right) }
+            if left <= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Included(right)
+            }
         }
         (Bound::Excluded(left), Bound::Excluded(right)) => {
-            if left <= right { Bound::Excluded(left) } else { Bound::Excluded(right) }
+            if left <= right {
+                Bound::Excluded(left)
+            } else {
+                Bound::Excluded(right)
+            }
         }
-    }
-}
-
-impl From<ArrayBuf<f32, Buffer<f32>>> for Collection {
-    fn from(tensor: ArrayBuf<f32, Buffer<f32>>) -> Self {
-        Collection::Tensor(Tensor::F32(Box::new(tensor)))
-    }
-}
-
-impl From<ArrayBuf<u64, Buffer<u64>>> for Collection {
-    fn from(tensor: ArrayBuf<u64, Buffer<u64>>) -> Self {
-        Collection::Tensor(Tensor::U64(Box::new(tensor)))
     }
 }
 
@@ -157,6 +185,11 @@ impl<'en> en::IntoStream<'en> for Collection {
             Collection::BTree(_) => {
                 return Err(E::Error::custom(
                     "BTree literal encoding is transport-specific and must be encoded at the boundary layer",
+                ));
+            }
+            Collection::Table(_) => {
+                return Err(E::Error::custom(
+                    "Table literal encoding is transport-specific and must be encoded at the boundary layer",
                 ));
             }
             Collection::Tensor(tensor) => {
@@ -182,123 +215,8 @@ impl TryCastFrom<Collection> for Tensor {
     fn opt_cast_from(collection: Collection) -> Option<Self> {
         match collection {
             Collection::Tensor(tensor) => Some(tensor),
-            Collection::BTree(_) => None,
+            Collection::BTree(_) | Collection::Table(_) => None,
         }
-    }
-}
-
-impl<'en> en::IntoStream<'en> for Tensor {
-    fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
-        let mut seq = encoder.encode_seq(Some(2))?;
-        match self {
-            Tensor::F32(array) => {
-                let schema = (
-                    number_type_path(&NumberType::Float(FloatType::F32)).to_string(),
-                    array
-                        .shape()
-                        .iter()
-                        .map(|dim| *dim as u64)
-                        .collect::<Vec<_>>(),
-                );
-                seq.encode_element(schema)?;
-                let values = array
-                    .buffer()
-                    .map_err(E::Error::custom)?
-                    .to_slice()
-                    .map_err(E::Error::custom)?
-                    .into_vec();
-                seq.encode_element(values)?;
-            }
-            Tensor::F64(array) => {
-                let schema = (
-                    number_type_path(&NumberType::Float(FloatType::F64)).to_string(),
-                    array
-                        .shape()
-                        .iter()
-                        .map(|dim| *dim as u64)
-                        .collect::<Vec<_>>(),
-                );
-                seq.encode_element(schema)?;
-                let values = array
-                    .buffer()
-                    .map_err(E::Error::custom)?
-                    .to_slice()
-                    .map_err(E::Error::custom)?
-                    .into_vec();
-                seq.encode_element(values)?;
-            }
-            Tensor::U64(array) => {
-                let schema = (
-                    number_type_path(&NumberType::UInt(UIntType::U64)).to_string(),
-                    array
-                        .shape()
-                        .iter()
-                        .map(|dim| *dim as u64)
-                        .collect::<Vec<_>>(),
-                );
-                seq.encode_element(schema)?;
-                let values = array
-                    .buffer()
-                    .map_err(E::Error::custom)?
-                    .to_slice()
-                    .map_err(E::Error::custom)?
-                    .into_vec();
-                seq.encode_element(values)?;
-            }
-        }
-        seq.end()
-    }
-}
-
-impl<'en> en::ToStream<'en> for Tensor {
-    fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
-    }
-}
-
-impl de::FromStream for Tensor {
-    type Context = Arc<dyn Transaction>;
-
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
-        decoder: &mut D,
-    ) -> Result<Self, D::Error> {
-        struct TensorVisitor;
-
-        impl de::Visitor for TensorVisitor {
-            type Value = Tensor;
-
-            fn expecting() -> &'static str {
-                "a TinyChain tensor payload"
-            }
-
-            async fn visit_seq<A: de::SeqAccess>(
-                self,
-                mut seq: A,
-            ) -> Result<Self::Value, A::Error> {
-                let (dtype_path, shape): (String, Vec<u64>) = seq
-                    .next_element(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("missing tensor schema"))?;
-                let dtype = tensor_dtype_from_wire(&dtype_path).ok_or_else(|| {
-                    de::Error::invalid_value(
-                        dtype_path,
-                        "a TinyChain numeric type path for tensor dtype",
-                    )
-                })?;
-
-                let shape = coerce_shape(shape).map_err(de::Error::custom)?;
-
-                let values = seq
-                    .next_element::<Vec<Number>>(())
-                    .await?
-                    .ok_or_else(|| de::Error::custom("missing tensor values"))?;
-
-                tensor_from_parts(dtype, shape, values).map_err(de::Error::custom)
-            }
-        }
-
-        decoder.decode_seq(TensorVisitor).await
     }
 }
 
@@ -340,7 +258,6 @@ pub fn null_transaction() -> Arc<dyn Transaction> {
 
 #[derive(Clone)]
 pub struct StateContext {
-    transaction: Arc<dyn Transaction>,
     btree_roots: Option<(
         freqfs::DirLock<PersistentFile>,
         freqfs::DirLock<PersistentFile>,
@@ -348,14 +265,11 @@ pub struct StateContext {
 }
 
 impl StateContext {
-    pub fn new(transaction: Arc<dyn Transaction>) -> Self {
-        Self {
-            transaction,
-            btree_roots: None,
-        }
+    pub fn new(_transaction: Arc<dyn Transaction>) -> Self {
+        Self { btree_roots: None }
     }
 
-    pub fn with_btree_roots(
+    pub fn with_state_roots(
         mut self,
         persistent_dir: freqfs::DirLock<PersistentFile>,
         txn_root: freqfs::DirLock<PersistentFile>,
@@ -364,13 +278,9 @@ impl StateContext {
         self
     }
 
-    pub(crate) fn transaction(&self) -> Arc<dyn Transaction> {
-        Arc::clone(&self.transaction)
-    }
-
-    pub(super) fn btree_decode_context(&self) -> Result<BTreeDecodeContext, String> {
+    pub(super) fn state_decode_context(&self) -> Result<BTreeDecodeContext, String> {
         let (persistent_dir, txn_root) = self.btree_roots.clone().ok_or_else(|| {
-            "BTree decode requires StateContext::with_btree_roots(...) at bootstrap".to_string()
+            "BTree decode requires StateContext::with_state_roots(...) at bootstrap".to_string()
         })?;
 
         Ok(BTreeDecodeContext::new(persistent_dir, txn_root))
@@ -387,7 +297,7 @@ pub fn state_context(transaction: Arc<dyn Transaction>) -> StateContext {
     StateContext::new(transaction)
 }
 
-/// Transitional TinyChain state enum.
+/// TinyChain runtime state.
 #[derive(Clone, Debug)]
 pub enum State {
     None,
@@ -396,7 +306,6 @@ pub enum State {
     Tuple(Vec<State>),
     Collection(Collection),
 }
-
 
 impl State {
     pub fn is_none(&self) -> bool {
@@ -438,9 +347,9 @@ impl TryCastFrom<State> for Vec<Value> {
     fn can_cast_from(state: &State) -> bool {
         match state {
             State::Tuple(items) => items.iter().all(Value::can_cast_from),
-            State::Scalar(Scalar::Tuple(items)) => items
-                .iter()
-                .all(|item| matches!(item, Scalar::Value(_))),
+            State::Scalar(Scalar::Tuple(items)) => {
+                items.iter().all(|item| matches!(item, Scalar::Value(_)))
+            }
             state => Value::can_cast_from(state),
         }
     }
@@ -463,6 +372,41 @@ impl From<Collection> for State {
     }
 }
 
+impl From<Table> for State {
+    fn from(table: Table) -> Self {
+        State::Collection(Collection::from(table))
+    }
+}
+
+impl TryCastFrom<State> for Scalar {
+    fn can_cast_from(state: &State) -> bool {
+        match state {
+            State::None | State::Scalar(_) => true,
+            State::Map(map) => map.values().all(Self::can_cast_from),
+            State::Tuple(items) => items.iter().all(Self::can_cast_from),
+            State::Collection(_) => false,
+        }
+    }
+
+    fn opt_cast_from(state: State) -> Option<Self> {
+        match state {
+            State::None => Some(Scalar::Value(Value::None)),
+            State::Scalar(scalar) => Some(scalar),
+            State::Map(map) => map
+                .into_iter()
+                .map(|(key, value)| Self::opt_cast_from(value).map(|value| (key, value)))
+                .collect::<Option<Map<_>>>()
+                .map(Scalar::Map),
+            State::Tuple(items) => items
+                .into_iter()
+                .map(Self::opt_cast_from)
+                .collect::<Option<Vec<_>>>()
+                .map(Scalar::Tuple),
+            State::Collection(_) => None,
+        }
+    }
+}
+
 impl<'en> en::IntoStream<'en> for State {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         match self {
@@ -478,6 +422,12 @@ impl<'en> en::IntoStream<'en> for State {
 impl From<Number> for State {
     fn from(number: Number) -> Self {
         State::from(Value::from(number))
+    }
+}
+
+impl From<u64> for State {
+    fn from(number: u64) -> Self {
+        State::from(Number::from(number))
     }
 }
 
