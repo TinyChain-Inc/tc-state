@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-b-tree = { path = "../deps/b-tree" }
 destream = { path = "../deps/destream", version = "0.10" }
-freqfs = { path = "../deps/freqfs", version = "0.13" }
-ha-ndarray = { path = "../deps/ha-ndarray", version = "0.5" }
+futures = "0.3"
 number-general = { path = "../deps/number-general", version = "0.14", default-features = false, features = ["stream"] }
 pathlink = { path = "../deps/pathlink" }
 safecast = "0.2"
@@ -15,10 +13,10 @@ tc-ir = { path = "../tc-ir" }
 tc-collection = { path = "../tc-collection" }
 tc-error = { path = "../tc-error" }
 tc-value = { path = "../tc-value" }
-umask = "2.1"
 
 [dev-dependencies]
 bytes = "1"
 destream_json = { path = "../deps/destream_json" }
-futures = "0.3"
+freqfs = { path = "../deps/freqfs", version = "0.13" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "fs", "macros"] }
+umask = "2.1"

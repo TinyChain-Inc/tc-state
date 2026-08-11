@@ -21,19 +21,19 @@ See `ROADMAP.md` for the phase breakdown (control-plane readiness, media storage
 temporal access patterns) and cross-references to `tc-server`, `tc-chain`, and
 client deliverables.
 
-## Txfs layout invariant
+## Storage boundary
 
-TinyChain persists state via a single transactional directory (`data_dir`) per
-host. Every state path mirrors its URI segments exactly:
+`tc-state` does not own a filesystem root or construct a `freqfs::Cache`. The
+host decodes state with its active transaction capability and delegates
+collection directories from the single workspace cache. Persistent named
+BTree/Table values mirror `/state/collection/...` beneath `workspace`; temporary
+collection values live beneath `<workspace>/txn/<txn-id>`.
 
-- `/state/foo/bar` ↔ `<data_dir>/state/foo/bar`
-- `/lib/publisher/library/1.0.0` ↔ `<data_dir>/lib/publisher/library/1.0.0`
-- `/state/media/publisher/assets/<id>` ↔ `<data_dir>/state/media/publisher/assets/<id>`
-
-There are no alternate roots or adapter-specific mount points. Queue services,
-PyO3, HTTP, and future transports all talk to the same layout, so any code in
-`tc-state` that writes to disk must preserve this invariant. The integration
-tests planned in the roadmap will enforce it automatically.
+The server's separate `data_dir` cache stores Library schemas and executable
+artifacts only and is not visible to `tc-state`. HTTP, PyO3, and future adapters
+must reuse the same host-owned `Workspace` capability rather than loading an
+adapter-specific root. See [`../docs/storage.md`](../docs/storage.md) for the
+canonical two-cache layout.
 
 ## Control-plane bootstrap helpers
 
@@ -89,9 +89,9 @@ chunk manager stabilizes.
 
 - `destream::FromStream` and `IntoStream` implementations must always agree on the
   exact shape of the payload they exchange. If you touch one, audit the other.
-- Tensors use the tuple schema from the reference host:
-  `[(ValueType::Number path, shape), values]`. This keeps our transitional crate
-  compatible with PyO3/HTTP adapters today and the full TinyChain host tomorrow.
+- Tensors use the canonical tuple schema
+  `[(ValueType::Number path, shape), values]` at serialization boundaries.
+  Native routing and local execution retain the in-memory Tensor representation.
 - Reuse the path-prefix constants defined beside each class/type when constructing
   new URIs so `/state/...` segments stay canonical across adapters.
 
