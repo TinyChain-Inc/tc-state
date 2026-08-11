@@ -195,22 +195,6 @@ impl<Txn> TryCastFrom<State<Txn>> for Scalar {
 impl<Txn: tc_collection::StorageContext + 'static> tc_collection::CollectionState for State<Txn> {
     type Txn = Txn;
 
-    fn none() -> Self {
-        State::None
-    }
-
-    fn from_scalar(scalar: Scalar) -> Self {
-        Self::from(scalar)
-    }
-
-    fn from_value(value: Value) -> Self {
-        Self::from(value)
-    }
-
-    fn from_collection(collection: Collection<Txn>) -> Self {
-        Self::from(collection)
-    }
-
     fn into_scalar(self) -> tc_error::TCResult<Scalar> {
         Scalar::try_cast_from(self, |_| {
             tc_error::TCError::bad_request("expected scalar state")
