@@ -10,7 +10,7 @@ use tc_value::{NumberType, Value};
 use super::*;
 
 #[derive(Clone, Debug)]
-struct TestTxn {
+pub(super) struct TestTxn {
     id: TxnId,
     claim: Claim,
     root: freqfs::DirLock<PersistentFile>,
@@ -370,13 +370,15 @@ fn tensor_facade_slice_roundtrip() {
 
 #[test]
 fn production_sources_do_not_construct_freqfs_cache() {
-    const SOURCES: [(&str, &str); 7] = [
+    const SOURCES: [(&str, &str); 9] = [
         ("src/lib.rs", include_str!("../lib.rs")),
         ("src/codec/class.rs", include_str!("../codec/class.rs")),
         ("src/codec/decode.rs", include_str!("../codec/decode.rs")),
         ("src/codec/helpers.rs", include_str!("../codec/helpers.rs")),
         ("src/codec/mod.rs", include_str!("../codec/mod.rs")),
         ("src/codec/parse.rs", include_str!("../codec/parse.rs")),
+        ("src/runtime/class.rs", include_str!("class.rs")),
+        ("src/runtime/route.rs", include_str!("route.rs")),
         ("src/runtime/mod.rs", include_str!("mod.rs")),
     ];
 

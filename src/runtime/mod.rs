@@ -9,6 +9,10 @@ use tc_collection::table::Table;
 use tc_ir::{Map, Scalar};
 use tc_value::Value;
 
+mod class;
+pub use class::*;
+mod route;
+
 pub use crate::codec::{BTreeType, CollectionType, StateType, TableType, TensorType};
 pub use tc_collection::tensor::{AxisRange, Range, Tensor, TensorReduceResult};
 pub use tc_collection::Collection;
@@ -22,6 +26,7 @@ pub enum State<Txn> {
     Map(Map<State<Txn>>),
     Tuple(Vec<State<Txn>>),
     Collection(Collection<Txn>),
+    Object(Box<Object<Txn>>),
 }
 
 impl<Txn> State<Txn> {
@@ -157,6 +162,12 @@ impl<Txn> From<Collection<Txn>> for State<Txn> {
     }
 }
 
+impl<Txn> From<Object<Txn>> for State<Txn> {
+    fn from(object: Object<Txn>) -> Self {
+        State::Object(Box::new(object))
+    }
+}
+
 impl<Txn> From<Table<Txn>> for State<Txn> {
     fn from(table: Table<Txn>) -> Self {
         State::Collection(Collection::from(table))
@@ -169,7 +180,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Scalar {
             State::None | State::Scalar(_) => true,
             State::Map(map) => map.values().all(Self::can_cast_from),
             State::Tuple(items) => items.iter().all(Self::can_cast_from),
-            State::Collection(_) => false,
+            State::Collection(_) | State::Object(_) => false,
         }
     }
 
@@ -187,7 +198,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Scalar {
                 .map(Self::opt_cast_from)
                 .collect::<Option<Vec<_>>>()
                 .map(Scalar::Tuple),
-            State::Collection(_) => None,
+            State::Collection(_) | State::Object(_) => None,
         }
     }
 }

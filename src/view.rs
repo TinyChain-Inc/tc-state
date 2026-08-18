@@ -40,6 +40,10 @@ where
             State::Collection(collection) => {
                 collection.into_view(txn).await.map(StateView::Collection)
             }
+            State::Object(_) => Err(tc_error::TCError::new(
+                tc_error::ErrorKind::NotImplemented,
+                "Class/instance views require the canonical tcv2#68 wire contract",
+            )),
         }
     })
 }
