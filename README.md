@@ -98,6 +98,9 @@ chunk manager stabilizes.
 ## Status & next steps
 
 - Track open work in `ROADMAP.md`.
+- See [`docs/class-runtime.md`](docs/class-runtime.md) for the v1→v2 Class
+  parity inventory, native member-resolution contract, and canonical-fixture
+  dependency which gates only the versioned Class codec.
 - Update this README whenever the txfs contract or bootstrap helpers evolve so
   future contributors do not have to reverse-engineer the layout.
 - When integrating with other crates, keep the code surface minimal and reuse
