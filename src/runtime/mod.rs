@@ -12,15 +12,18 @@ use tc_value::Value;
 mod class;
 pub use class::*;
 mod route;
+pub use route::{StateExecutor, Static};
+mod resolve;
+pub use resolve::{resolve_ref, resolve_scalar as resolve};
 
-pub use crate::codec::{BTreeType, CollectionType, StateType, TableType, TensorType};
+pub use crate::codec::{BTreeType, CollectionType, ObjectType, StateType, TableType, TensorType};
 pub use tc_collection::tensor::{AxisRange, Range, Tensor, TensorReduceResult};
 pub use tc_collection::Collection;
-pub use tc_ir::{Class, NativeClass};
+pub use tc_value::class::{Class, NativeClass};
 
 /// TinyChain runtime state.
 #[derive(Clone, Debug)]
-pub enum State<Txn> {
+pub enum State<Txn: tc_collection::StorageContext> {
     None,
     Scalar(Scalar),
     Map(Map<State<Txn>>),
@@ -29,7 +32,7 @@ pub enum State<Txn> {
     Object(Box<Object<Txn>>),
 }
 
-impl<Txn> State<Txn> {
+impl<Txn: tc_collection::StorageContext> State<Txn> {
     /// Lift a transaction-free IR scalar into its structural State form.
     pub fn from_scalar(scalar: Scalar) -> Self {
         match scalar {
@@ -55,25 +58,47 @@ impl<Txn> State<Txn> {
     }
 }
 
-impl<Txn> Default for State<Txn> {
+impl<Txn: tc_collection::StorageContext> Default for State<Txn> {
     fn default() -> Self {
         State::Scalar(Scalar::default())
     }
 }
 
-impl<Txn> From<Value> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Value> for State<Txn> {
     fn from(value: Value) -> Self {
         State::Scalar(Scalar::from(value))
     }
 }
 
-impl<Txn> From<Scalar> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Scalar> for State<Txn> {
     fn from(scalar: Scalar) -> Self {
         Self::from_scalar(scalar)
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Value {
+impl<Txn: tc_collection::StorageContext> From<Map<State<Txn>>> for State<Txn> {
+    fn from(map: Map<State<Txn>>) -> Self {
+        Self::Map(map)
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> From<Vec<State<Txn>>> for State<Txn> {
+    fn from(tuple: Vec<State<Txn>>) -> Self {
+        Self::Tuple(tuple)
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> From<Map<bool>> for State<Txn> {
+    fn from(map: Map<bool>) -> Self {
+        Self::Map(
+            map.into_iter()
+                .map(|(name, value)| (name, Self::from(Number::from(value))))
+                .collect(),
+        )
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Value {
     fn can_cast_from(state: &State<Txn>) -> bool {
         matches!(state, State::Scalar(Scalar::Value(_)))
     }
@@ -86,7 +111,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Value {
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Vec<Value> {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Vec<Value> {
     fn can_cast_from(state: &State<Txn>) -> bool {
         match state {
             State::Tuple(items) => items.iter().all(Value::can_cast_from),
@@ -109,7 +134,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Vec<Value> {
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Vec<State<Txn>> {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Vec<State<Txn>> {
     fn can_cast_from(state: &State<Txn>) -> bool {
         matches!(state, State::Tuple(_) | State::Scalar(Scalar::Tuple(_)))
     }
@@ -125,7 +150,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Vec<State<Txn>> {
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Map<State<Txn>> {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Map<State<Txn>> {
     fn can_cast_from(state: &State<Txn>) -> bool {
         matches!(state, State::Map(_) | State::Scalar(Scalar::Map(_)))
     }
@@ -143,7 +168,7 @@ impl<Txn> TryCastFrom<State<Txn>> for Map<State<Txn>> {
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Tensor {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Tensor {
     fn can_cast_from(state: &State<Txn>) -> bool {
         matches!(state, State::Collection(Collection::Tensor(_)))
     }
@@ -156,25 +181,25 @@ impl<Txn> TryCastFrom<State<Txn>> for Tensor {
     }
 }
 
-impl<Txn> From<Collection<Txn>> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Collection<Txn>> for State<Txn> {
     fn from(collection: Collection<Txn>) -> Self {
         State::Collection(collection)
     }
 }
 
-impl<Txn> From<Object<Txn>> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Object<Txn>> for State<Txn> {
     fn from(object: Object<Txn>) -> Self {
         State::Object(Box::new(object))
     }
 }
 
-impl<Txn> From<Table<Txn>> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Table<Txn>> for State<Txn> {
     fn from(table: Table<Txn>) -> Self {
         State::Collection(Collection::from(table))
     }
 }
 
-impl<Txn> TryCastFrom<State<Txn>> for Scalar {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Scalar {
     fn can_cast_from(state: &State<Txn>) -> bool {
         match state {
             State::None | State::Scalar(_) => true,
@@ -245,13 +270,13 @@ impl<Txn: tc_collection::StorageContext + 'static> tc_ir::StateInstance for Stat
     type Transaction = Txn;
 }
 
-impl<Txn> From<Number> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<Number> for State<Txn> {
     fn from(number: Number) -> Self {
         State::from(Value::from(number))
     }
 }
 
-impl<Txn> From<u64> for State<Txn> {
+impl<Txn: tc_collection::StorageContext> From<u64> for State<Txn> {
     fn from(number: u64) -> Self {
         State::from(Number::from(number))
     }

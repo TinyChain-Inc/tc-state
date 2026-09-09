@@ -19,7 +19,7 @@ pub(super) struct TestTxn {
 }
 
 impl TestTxn {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let root = std::env::temp_dir().join(format!(
             "tc-state-test-txn-{}",
             std::time::SystemTime::now()
@@ -63,6 +63,8 @@ impl Transaction for TestTxn {
 }
 
 impl tc_collection::StorageContext for TestTxn {
+    type File = PersistentFile;
+
     fn context(
         &self,
     ) -> impl std::future::Future<Output = tc_error::TCResult<freqfs::DirLock<PersistentFile>>> + Send
@@ -126,6 +128,15 @@ where
         .map_err(|err| err.to_string())
 }
 
+#[tokio::test]
+async fn state_decoder_rejects_the_shared_shadowing_fixture() {
+    let fixture = include_bytes!("../../../tc-ir/fixtures/lexical/invalid-shadow.json");
+    let error = decode_json::<TestState>(TestTxn::new(), fixture.to_vec())
+        .await
+        .expect_err("reject nested lexical shadowing");
+    assert!(error.contains("shadowed OpDef binding"), "{error}");
+}
+
 #[test]
 fn state_casts_to_value_and_value_vector() {
     let value = Value::try_cast_from(TestState::from(Value::from(7_u64)), |_| "invalid value")
@@ -166,6 +177,70 @@ async fn scalar_numbers_round_trip() {
     assert!(matches!(
         state,
         State::Scalar(Scalar::Value(Value::Number(_)))
+    ));
+}
+
+#[tokio::test]
+async fn class_instance_round_trip_is_self_contained() {
+    let identity: pathlink::Link = "/class/example-devco/vector/1.0.0"
+        .parse()
+        .expect("Class identity");
+    let parent = ClassParent::Native(StateType::Tuple);
+    let prototype: Map<_> = [(
+        "dimensions".parse().expect("member ID"),
+        Scalar::from(Value::from(3_u64)),
+    )]
+    .into_iter()
+    .collect();
+    let body = ClassBody::new(parent, prototype);
+    let class = ClassDef::from_body(identity, body);
+    let members: Map<_> = [(
+        "name".parse().expect("member ID"),
+        TestState::from(Value::from("v")),
+    )]
+    .into_iter()
+    .collect();
+    let instance = ClassInstance::new(
+        TestState::Tuple(vec![TestState::from(1_u64)]),
+        class.clone(),
+        members,
+    );
+    let state = TestState::from(Object::Instance(instance));
+
+    let encoded = encode_json(
+        state
+            .into_view(TestTxn::new())
+            .await
+            .expect("instance view"),
+    )
+    .await;
+    let decoded: TestState = decode_json(TestTxn::new(), encoded)
+        .await
+        .expect("decode instance");
+    let State::Object(object) = decoded else {
+        panic!("expected decoded object")
+    };
+    let Object::Instance(instance) = *object else {
+        panic!("expected decoded instance")
+    };
+    assert_eq!(instance.class(), &class);
+    assert!(matches!(instance.parent(), State::Tuple(items) if items.len() == 1));
+    assert_eq!(instance.members().len(), 1);
+
+    let class_state = TestState::from(Object::Class(class.clone()));
+    let encoded = encode_json(
+        class_state
+            .into_view(TestTxn::new())
+            .await
+            .expect("Class view"),
+    )
+    .await;
+    let decoded: TestState = decode_json(TestTxn::new(), encoded)
+        .await
+        .expect("decode Class");
+    assert!(matches!(
+        decoded,
+        State::Object(object) if matches!(&*object, Object::Class(decoded) if decoded == &class)
     ));
 }
 

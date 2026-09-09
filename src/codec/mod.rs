@@ -4,5 +4,5 @@ mod encode;
 mod helpers;
 mod parse;
 
-pub use class::{CollectionType, StateType};
+pub use class::{CollectionType, ObjectType, StateType};
 pub use tc_collection::{BTreeType, TableType, TensorType};

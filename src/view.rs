@@ -1,7 +1,17 @@
 use tc_error::TCResult;
 use tc_ir::{IntoView, Map, Scalar};
 
-use crate::State;
+use crate::{ClassDef, ClassInstance, Object, State};
+
+/// A transaction-consistent terminal representation of a user-defined object.
+pub enum ObjectView {
+    Class(ClassDef),
+    Instance {
+        parent: Box<StateView>,
+        class: ClassDef,
+        members: Map<StateView>,
+    },
+}
 
 /// A transaction-consistent terminal representation of [`State`].
 pub enum StateView {
@@ -10,6 +20,7 @@ pub enum StateView {
     Map(Map<StateView>),
     Tuple(Vec<StateView>),
     Collection(tc_collection::CollectionView),
+    Object(ObjectView),
 }
 
 fn state_view<Txn>(
@@ -40,12 +51,30 @@ where
             State::Collection(collection) => {
                 collection.into_view(txn).await.map(StateView::Collection)
             }
-            State::Object(_) => Err(tc_error::TCError::new(
-                tc_error::ErrorKind::NotImplemented,
-                "Class/instance views require the canonical tcv2#68 wire contract",
-            )),
+            State::Object(object) => match *object {
+                Object::Class(class) => Ok(StateView::Object(ObjectView::Class(class))),
+                Object::Instance(instance) => instance_view(instance, txn).await,
+            },
         }
     })
+}
+
+async fn instance_view<Txn>(instance: ClassInstance<Txn>, txn: Txn) -> TCResult<StateView>
+where
+    Txn: tc_collection::StorageContext + 'static,
+{
+    let (parent, class, members) = instance.into_parts();
+    let parent = Box::new(state_view(parent, txn.clone()).await?);
+    let mut member_view = Map::new();
+    for (id, member) in members {
+        member_view.insert(id, state_view(member, txn.clone()).await?);
+    }
+
+    Ok(StateView::Object(ObjectView::Instance {
+        parent,
+        class,
+        members: member_view,
+    }))
 }
 
 impl<Txn> IntoView for State<Txn>

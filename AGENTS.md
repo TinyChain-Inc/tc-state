@@ -1,7 +1,7 @@
 ## tc-state Agent Notes
 
-- `tc-state` is the universal value and conversion boundary, not a collection
-  runtime, router, storage owner, or transport codec. Delegate collection
+- `tc-state` is the universal value, resolution, and native routing boundary,
+  not a collection runtime, storage owner, or transport codec. Delegate collection
   behavior to `tc-collection` and transport projection to adapters; remove any
   duplicate helper instead of maintaining a compatibility path.
 - Maintain `destream` parity: every `FromStream` in this crate must parse exactly
@@ -48,9 +48,12 @@
 - Do not construct `freqfs::Cache` in production `tc-state` module code. State
   decoding receives only a kernel-delegated collection allocation context; it does
   not receive filesystem paths, construct roots, or retain a transaction ID/handle.
-  Named collections are URI-derived by host workspace delegation and literal BTree/
-  Table values receive unique transaction children. Any cache construction in this
-  crate must be limited to `#[cfg(test)]` helpers.
-- State and collection leaves use only directories delegated from the host's
-  workspace cache. The separate `data_dir` cache belongs exclusively to the
-  server's library/artifact store; see [`../docs/storage.md`](../docs/storage.md).
+  Literal and transaction-local BTree/Table values receive delegated allocation
+  children. Persistent named collections remain unsupported until Service and
+  Chain own them. Any cache construction in this crate must be limited to
+  `#[cfg(test)]` helpers.
+- State and collection leaves use only allocation contexts delegated by their
+  caller. They do not know or select a host data or workspace root. The parent
+  superproject's
+  [storage document](https://github.com/TinyChain-Inc/tcv2/blob/main/docs/storage.md)
+  is non-normative integration context for the host layout.

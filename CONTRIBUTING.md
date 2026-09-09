@@ -1,49 +1,21 @@
 # Contributing to tc-state
 
-`tc-state` prototypes TinyChain’s state subsystem (collections, `/state/media`,
-bootstrap helpers). Keep contributions focused on refining the shared txfs
-layout and serialization contracts so every adapter can hydrate the same tree.
+Read this repository's [invariants](AGENTS.md). The parent workspace
+[contributor guide](https://github.com/TinyChain-Inc/tcv2/blob/main/CONTRIBUTING.md)
+is non-normative integration context for contributors working in a superproject
+checkout.
 
-## Before you start
+Keep changes within universal State, native routing/resolution, Class/Object
+semantics, views, and codecs. Filesystem policy, application bootstrap,
+transports, and collection implementations belong to their respective owners.
 
-- Read this crate’s `README.md`, `ROADMAP.md`, and `AGENTS.md` to understand the
-  current scope (bootstrap, media experiments, retention defaults).
-- Keep formatting and linting clean: run `cargo fmt` and
-  `cargo clippy --all-targets --all-features -D warnings`.
+Before opening a pull request, run:
 
-## Development checklist
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+```
 
-1. **Plan schema changes.** Update `ROADMAP.md` (or crate-local docs) when
-   adding new `/state/...` prefixes, media layouts, or bootstrap files so
-   hosts/clients can prepare for the new contract.
-2. **Preserve URI ↔ txfs mirroring.** Any code that touches disk must keep the
-   `<data-dir>/<segment>` layout perfectly aligned with the URI helper
-   constants. Add tests if you introduce new helpers.
-3. **Serialization symmetry.** Whenever you edit `destream::IntoStream` or
-   `FromStream` implementations, add/refresh round-trip tests. Tensors, maps,
-   and media descriptors all need deterministic shapes.
-4. **Testing.**
-   - Run `cargo test -p tc-state --all-features` locally.
-   - Add focused unit tests for new media chunks, retention policies, or
-     bootstrap loaders.
-5. **Docs.** Reflect behavioral changes in `README.md`, `AGENTS.md`, and any
-   relevant docs. Call out migration steps (e.g., required txfs
-   migrations) so hosts can upgrade safely.
-6. **No fallback flows.** Remove legacy pathways instead of adding new ones; the
-   crate should model the single canonical state layout.
-
-## Pre-submit
-
-- `cargo fmt`
-- `cargo clippy --all-targets --all-features`
-- `cargo test -p tc-state --all-features`
-- Update docs + roadmap notes, and summarize rollout considerations in your PR
-  description (data migrations, queue updates, compliance implications, etc.).
-
-## Rights and licensing
-
-By contributing to this crate you represent that (a) you authored the work (or
-otherwise have the rights to contribute it), (b) the contribution is unencumbered
-by third-party intellectual property claims, and (c) you transfer and assign all
-right, title, and interest in the contribution to The TinyChain Contributors for
-distribution under the Apache 2.0 license (see `LICENSE`).
+When a wire representation changes, update both streaming directions and the
+shared fixtures in the same change.

@@ -5,7 +5,7 @@ mod runtime;
 mod view;
 
 pub use runtime::*;
-pub use view::StateView;
+pub use view::{ObjectView, StateView};
 
 #[cfg(test)]
 mod architecture_tests {

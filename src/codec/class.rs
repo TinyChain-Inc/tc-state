@@ -1,11 +1,16 @@
 use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
 pub use tc_collection::CollectionType;
-use tc_ir::{Class, NativeClass};
+use tc_value::class::{Class, NativeClass};
 use tc_value::ValueType;
 
 const STATE_SCALAR_TUPLE_PATH: PathLabel = path_label(&["state", "scalar", "tuple"]);
+const STATE_OBJECT_CLASS_PATH: PathLabel = path_label(&["state", "object", "class"]);
+const STATE_OBJECT_INSTANCE_PATH: PathLabel = path_label(&["state", "object", "instance"]);
 
 const LABEL_STATE: Label = label("state");
+const LABEL_OBJECT: Label = label("object");
+const LABEL_CLASS: Label = label("class");
+const LABEL_INSTANCE: Label = label("instance");
 const LABEL_SCALAR: Label = label("scalar");
 const LABEL_TUPLE: Label = label("tuple");
 
@@ -15,6 +20,14 @@ pub enum StateType {
     Scalar(ValueType),
     Tuple,
     Collection(CollectionType),
+    Object(ObjectType),
+}
+
+/// Canonical runtime object classes.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ObjectType {
+    Class,
+    Instance,
 }
 
 impl Class for StateType {}
@@ -23,6 +36,14 @@ impl NativeClass for StateType {
     fn from_path(path: &[PathSegment]) -> Option<Self> {
         if path_matches(path, &STATE_SCALAR_TUPLE_PATH) {
             return Some(Self::Tuple);
+        }
+
+        if path_matches(path, &STATE_OBJECT_CLASS_PATH) {
+            return Some(Self::Object(ObjectType::Class));
+        }
+
+        if path_matches(path, &STATE_OBJECT_INSTANCE_PATH) {
+            return Some(Self::Object(ObjectType::Instance));
         }
 
         if let Some(collection) = CollectionType::from_path(path) {
@@ -40,6 +61,13 @@ impl NativeClass for StateType {
                 .append(LABEL_SCALAR)
                 .append(LABEL_TUPLE),
             Self::Collection(collection_type) => collection_type.path(),
+            Self::Object(object_type) => PathBuf::new()
+                .append(LABEL_STATE)
+                .append(LABEL_OBJECT)
+                .append(match object_type {
+                    ObjectType::Class => LABEL_CLASS,
+                    ObjectType::Instance => LABEL_INSTANCE,
+                }),
         }
     }
 }

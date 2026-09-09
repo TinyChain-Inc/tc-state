@@ -1,15 +1,110 @@
 use destream::de;
 use number_general::Number;
-use tc_ir::NativeClass;
 use tc_ir::{Map, Scalar};
+use tc_value::class::NativeClass;
 use tc_value::Value;
 
-use super::class::StateType;
+use super::class::{ObjectType, StateType};
 use super::helpers::{decode_op_def_entry, decode_value_entry, drain_remaining_entries};
 use super::parse::{parse_state_map_id, parse_state_path};
-use crate::runtime::State;
+use crate::runtime::{ClassDef, ClassInstance, Object, State};
 
-struct StateSeq<Txn>(Vec<State<Txn>>);
+struct InstancePayload<Txn: tc_collection::StorageContext> {
+    parent: State<Txn>,
+    class: ClassDef,
+    members: Map<State<Txn>>,
+}
+
+struct InstanceVisitor<Txn> {
+    context: Txn,
+}
+
+impl<Txn: tc_collection::StorageContext> de::Visitor for InstanceVisitor<Txn> {
+    type Value = InstancePayload<Txn>;
+
+    fn expecting() -> &'static str {
+        "a Class instance tuple [parent, class, members]"
+    }
+
+    async fn visit_seq<A: de::SeqAccess>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let parent = seq
+            .next_element::<State<Txn>>(self.context.subcontext("parent"))
+            .await?
+            .ok_or_else(|| de::Error::invalid_length(0, 3))?;
+        let class = seq
+            .next_element::<ClassDef>(())
+            .await?
+            .ok_or_else(|| de::Error::invalid_length(1, 3))?;
+        let StateMap(members) = seq
+            .next_element::<StateMap<Txn>>(self.context.subcontext("members"))
+            .await?
+            .ok_or_else(|| de::Error::invalid_length(2, 3))?;
+        if seq.next_element::<de::IgnoredAny>(()).await?.is_some() {
+            return Err(de::Error::invalid_length(4, 3));
+        }
+
+        Ok(InstancePayload {
+            parent,
+            class,
+            members,
+        })
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> de::FromStream for InstancePayload<Txn> {
+    type Context = Txn;
+
+    async fn from_stream<D: de::Decoder>(
+        context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        decoder.decode_seq(InstanceVisitor { context }).await
+    }
+}
+
+struct StateSeq<Txn: tc_collection::StorageContext>(Vec<State<Txn>>);
+
+struct StateMap<Txn: tc_collection::StorageContext>(Map<State<Txn>>);
+
+struct StateMapVisitor<Txn> {
+    context: Txn,
+}
+
+impl<Txn: tc_collection::StorageContext> de::Visitor for StateMapVisitor<Txn> {
+    type Value = Map<State<Txn>>;
+
+    fn expecting() -> &'static str {
+        "a TinyChain state map"
+    }
+
+    async fn visit_map<A: de::MapAccess>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = Map::new();
+        while let Some(key) = map.next_key::<String>(()).await? {
+            let id = parse_state_map_id(&key).map_err(de::Error::custom)?;
+            let value = map
+                .next_value::<State<Txn>>(self.context.subcontext(key))
+                .await?;
+            if out.insert(id, value).is_some() {
+                return Err(de::Error::custom("duplicate state map member"));
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> de::FromStream for StateMap<Txn> {
+    type Context = Txn;
+
+    async fn from_stream<D: de::Decoder>(
+        context: Self::Context,
+        decoder: &mut D,
+    ) -> Result<Self, D::Error> {
+        decoder
+            .decode_map(StateMapVisitor { context })
+            .await
+            .map(Self)
+    }
+}
 
 struct StateSeqVisitor<Txn> {
     context: Txn,
@@ -155,6 +250,22 @@ impl<Txn: tc_collection::StorageContext> de::Visitor for StateVisitor<Txn> {
                 let value = decode_value_entry(value_type, &mut map).await?;
                 drain_remaining_entries(&mut map).await?;
                 Ok(State::Scalar(Scalar::from(value)))
+            }
+            StateType::Object(ObjectType::Class) => {
+                let class = map.next_value::<ClassDef>(()).await?;
+                drain_remaining_entries(&mut map).await?;
+                Ok(State::Object(Box::new(Object::Class(class))))
+            }
+            StateType::Object(ObjectType::Instance) => {
+                let InstancePayload {
+                    parent,
+                    class,
+                    members,
+                } = map.next_value::<InstancePayload<Txn>>(self.context).await?;
+                drain_remaining_entries(&mut map).await?;
+                Ok(State::Object(Box::new(Object::Instance(
+                    ClassInstance::new(parent, class, members),
+                ))))
             }
         }
     }
