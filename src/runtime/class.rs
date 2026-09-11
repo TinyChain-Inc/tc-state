@@ -209,32 +209,6 @@ impl ClassDef {
             .then_some(())
             .ok_or(ClassError::DefinitionDigestMismatch)
     }
-
-    fn extend_referenced_methods(
-        &self,
-        requirements: &mut std::collections::BTreeMap<
-            Link,
-            std::collections::BTreeSet<tc_ir::Method>,
-        >,
-    ) {
-        for scalar in self.prototype.values() {
-            scalar.visit_referenced_methods(&mut |link, method| {
-                requirements.entry(link.clone()).or_default().insert(method);
-            });
-        }
-    }
-
-    pub fn effective_referenced_methods(
-        &self,
-        classes: &std::collections::BTreeMap<Link, Self>,
-    ) -> Result<
-        std::collections::BTreeMap<Link, std::collections::BTreeSet<tc_ir::Method>>,
-        ClassError,
-    > {
-        analyze_classes(classes, [self.identity.clone()])?
-            .remove(&self.identity)
-            .ok_or_else(|| ClassError::InvalidParent(self.identity.to_string()))
-    }
 }
 
 impl<D: AsyncDigest> AsyncHash<D> for &ClassDef {
@@ -244,30 +218,22 @@ impl<D: AsyncDigest> AsyncHash<D> for &ClassDef {
     }
 }
 
-/// Validate a Class batch and derive every effective application requirement in
-/// one memoized inheritance traversal.
-pub fn analyze_classes(
+/// Validate a Class batch in one memoized inheritance traversal.
+pub fn validate_classes(
     classes: &std::collections::BTreeMap<Link, ClassDef>,
     roots: impl IntoIterator<Item = Link>,
-) -> Result<
-    std::collections::BTreeMap<
-        Link,
-        std::collections::BTreeMap<Link, std::collections::BTreeSet<tc_ir::Method>>,
-    >,
-    ClassError,
-> {
-    type Requirements = std::collections::BTreeMap<Link, std::collections::BTreeSet<tc_ir::Method>>;
+) -> Result<(), ClassError> {
     type Members = std::collections::BTreeMap<Id, bool>;
 
-    fn analyze(
+    fn validate(
         identity: &Link,
         classes: &std::collections::BTreeMap<Link, ClassDef>,
         visiting: &mut std::collections::BTreeSet<Link>,
-        memo: &mut std::collections::BTreeMap<Link, (Requirements, Members)>,
+        memo: &mut std::collections::BTreeMap<Link, Members>,
         depth: usize,
-    ) -> Result<(Requirements, Members), ClassError> {
-        if let Some(analysis) = memo.get(identity) {
-            return Ok(analysis.clone());
+    ) -> Result<Members, ClassError> {
+        if let Some(members) = memo.get(identity) {
+            return Ok(members.clone());
         }
         if depth >= MAX_INHERITANCE_DEPTH {
             return Err(ClassError::InheritanceDepthExceeded {
@@ -281,8 +247,8 @@ pub fn analyze_classes(
             .get(identity)
             .ok_or_else(|| ClassError::InvalidParent(identity.to_string()))?;
         class.validate_digest()?;
-        let (mut requirements, mut members) = match class.parent() {
-            ClassParent::Class(parent) => analyze(parent, classes, visiting, memo, depth + 1)?,
+        let mut members = match class.parent() {
+            ClassParent::Class(parent) => validate(parent, classes, visiting, memo, depth + 1)?,
             ClassParent::Native(_) => Default::default(),
         };
         for (member, value) in class.prototype() {
@@ -294,25 +260,22 @@ pub fn analyze_classes(
             }
             members.insert(member.clone(), method);
         }
-        class.extend_referenced_methods(&mut requirements);
         visiting.remove(identity);
-        memo.insert(identity.clone(), (requirements.clone(), members.clone()));
-        Ok((requirements, members))
+        memo.insert(identity.clone(), members.clone());
+        Ok(members)
     }
 
     let mut memo = std::collections::BTreeMap::new();
-    let mut output = std::collections::BTreeMap::new();
     for identity in roots {
-        let (requirements, _) = analyze(
+        validate(
             &identity,
             classes,
             &mut std::collections::BTreeSet::new(),
             &mut memo,
             0,
         )?;
-        output.insert(identity, requirements);
     }
-    Ok(output)
+    Ok(())
 }
 
 impl de::FromStream for ClassDef {
@@ -570,6 +533,7 @@ pub enum ResolvedMember<'a, Txn: tc_collection::StorageContext> {
         value: &'a Scalar,
     },
     BoundMethod {
+        declared_by: &'a Link,
         definition: &'a tc_ir::OpDef,
         instance: &'a ClassInstance<Txn>,
     },
@@ -665,7 +629,7 @@ impl<Txn: tc_collection::StorageContext> ClassInstance<Txn> {
             }
 
             if let Some(value) = class.prototype.get(member) {
-                return Ok(bind(self, value));
+                return Ok(bind(self, &class.identity, value));
             }
 
             match &class.parent {
@@ -746,10 +710,12 @@ impl ClassDef {
 
 fn bind<'a, Txn: tc_collection::StorageContext>(
     instance: &'a ClassInstance<Txn>,
+    declared_by: &'a Link,
     value: &'a Scalar,
 ) -> ResolvedMember<'a, Txn> {
     match value {
         Scalar::Op(definition) => ResolvedMember::BoundMethod {
+            declared_by,
             definition,
             instance,
         },
@@ -870,7 +836,7 @@ mod tests {
 
     #[test]
     fn prototype_method_is_bound_to_exact_instance() {
-        let method = tc_ir::OpDef::Post(Vec::new());
+        let method = tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())]);
         let class = class(
             "class",
             ClassParent::Native(StateType::Tuple),
@@ -883,12 +849,37 @@ mod tests {
             .expect("bound method");
 
         let ResolvedMember::BoundMethod {
-            instance: bound, ..
+            declared_by,
+            instance: bound,
+            ..
         } = resolved
         else {
             panic!("expected bound method");
         };
+        assert_eq!(declared_by, instance.class().identity());
         assert!(std::ptr::eq(bound, &instance));
+    }
+
+    #[test]
+    fn inherited_method_reports_its_declaring_class() {
+        let parent = class(
+            "parent",
+            ClassParent::Native(StateType::Tuple),
+            &[(
+                "call",
+                Scalar::Op(tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())])),
+            )],
+        );
+        let child = class("child", ClassParent::Class(parent.identity().clone()), &[]);
+        let instance = instance(child, &[]);
+        let classes = BTreeMap::from([(parent.identity().clone(), parent.clone())]);
+        let ResolvedMember::BoundMethod { declared_by, .. } = instance
+            .resolve_member(&id("call"), &classes, |_, _, _| None)
+            .expect("inherited method")
+        else {
+            panic!("expected bound method");
+        };
+        assert_eq!(declared_by, parent.identity());
     }
 
     #[test]
@@ -964,7 +955,10 @@ mod tests {
         let invalid = class(
             "invalid",
             ClassParent::Class(class_link("base")),
-            &[("x", Scalar::Op(tc_ir::OpDef::Post(Vec::new())))],
+            &[(
+                "x",
+                Scalar::Op(tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())])),
+            )],
         );
         assert!(matches!(
             invalid.validate(&classes),
@@ -973,36 +967,28 @@ mod tests {
     }
 
     #[test]
-    fn effective_requirements_include_inherited_prototypes() {
-        let dependency: Link = "/lib/example-devco/math/1.0.0".parse().expect("dependency");
+    fn batch_validation_accepts_inherited_prototypes() {
         let base_id: Link = "/class/example-devco/base/1.0.0"
             .parse()
             .expect("base identity");
         let derived_id: Link = "/class/example-devco/derived/1.0.0"
             .parse()
             .expect("derived identity");
-        let reference = Scalar::from(tc_ir::TCRef::Op(tc_ir::OpRef::Get((
-            tc_ir::Subject::Link(dependency.clone()),
-            Scalar::default(),
-        ))));
         let base = ClassDef::from_body(
             base_id.clone(),
             ClassBody::new(
                 ClassParent::Native(StateType::Tuple),
-                [(id("value"), reference)].into_iter().collect(),
+                [(id("value"), scalar(1))].into_iter().collect(),
             ),
         );
         let derived = ClassDef::from_body(
             derived_id.clone(),
             ClassBody::new(ClassParent::Class(base_id.clone()), Map::new()),
         );
-        let classes = [(base_id, base), (derived_id, derived.clone())]
+        let classes = [(base_id, base), (derived_id.clone(), derived)]
             .into_iter()
             .collect();
-        let requirements = derived
-            .effective_referenced_methods(&classes)
-            .expect("effective requirements");
-        assert!(requirements[&dependency].contains(&tc_ir::Method::Get));
+        validate_classes(&classes, [derived_id]).expect("valid inherited prototype");
     }
 
     #[tokio::test]

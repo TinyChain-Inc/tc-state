@@ -12,13 +12,15 @@ and codec boundary without owning host storage or transports.
 - Native routing for scalar values, tuples, maps, objects, Classes, and delegated
   collections.
 - Canonical Class construction, digest verification, inheritance, cycle/depth
-  validation, and effective inherited application requirements.
+  validation, and declaring-Class method ownership.
 - Recursive transaction-consistent view acquisition before adapter encoding.
 
-Collection behavior belongs to `tc-collection`; graph planning belongs to
-`tc-ir`; graph scheduling and `OpDef` execution belong to `tc-server`.
-`StateExecutor` supplies the narrow callback capability needed for external
-dispatch, Class lookup, and server-owned `OpDef` execution.
+Collection behavior belongs to `tc-collection`. `tc-ir` reports syntax-level
+requirements but owns no execution plan; graph scheduling and `OpDef` execution
+belong to `tc-server`. `StateExecutor` is trusted in-process host SPI for external
+dispatch, Class lookup, and server-owned `OpDef` execution. Its declaring-Class
+origin is supplied only by canonical Class routing and is not encodable in State
+or IR.
 
 ## Non-responsibilities
 

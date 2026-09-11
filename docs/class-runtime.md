@@ -33,19 +33,22 @@ an `OpDef` becomes a bound handler carrying the complete concrete instance as
 `$self`. Missing native members return `NotFound` and never fall through to an
 external transport.
 
-Class analysis tracks visited identities and enforces the public inheritance
+Class validation tracks visited identities and enforces the public inheritance
 depth bound. Invalid parents, invalid prototypes, cycles, depth exhaustion,
 unsupported overrides, and digest mismatches remain distinct structured errors.
-`analyze_classes` validates a staged-plus-committed Class set and derives
-effective inherited application requirements in the same traversal.
+`validate_classes` validates a staged-plus-committed Class set in one memoized
+traversal. Application dependency policy is derived and enforced by the host,
+not by `tc-state`. An inherited method executes under the policy of the Class
+which declared it.
 
 ## Runtime boundary
 
 `StateExecutor` is the only host capability required by recursive State
 execution. It provides canonical Class lookup, outbound dispatch, and the
 callback for server-owned `OpDef` execution. The state layer preserves the
-transaction, deadline, method call, and concrete subject; it does not schedule
-graphs or choose transaction outcomes.
+transaction, deadline, method call, declaring-Class origin, and concrete
+subject; it does not aggregate application policy, schedule graphs, or choose
+transaction outcomes.
 
 Instances may be stored as ordinary collection values and participate in the
 owning collection's lifecycle. Class storage owns definitions only. Neither a
@@ -55,7 +58,7 @@ instance ID, or registry membership.
 ## Verification
 
 Changes require deterministic Class and instance round trips plus tests for
-member precedence, bound `$self`, native-parent delegation, inherited
-requirements, malformed definitions, cycles, and depth limits. A mocked
+member precedence, bound `$self`, native-parent delegation, declaring-Class
+ownership, malformed definitions, cycles, and depth limits. A mocked
 `StateExecutor` must demonstrate that nested dispatch preserves transaction and
 subject identity.

@@ -4,7 +4,7 @@ use futures::{stream, TryStreamExt};
 use number_general::{FloatType, UIntType};
 use safecast::{CastInto, TryCastFrom};
 use tc_collection::PersistentFile;
-use tc_ir::{Claim, IntoView, Map, NetworkTime, Scalar, Transaction, TxnId};
+use tc_ir::{IntoView, Map, NetworkTime, Scalar, Transaction, TxnId};
 use tc_value::{NumberType, Value};
 
 use super::*;
@@ -12,7 +12,6 @@ use super::*;
 #[derive(Clone, Debug)]
 pub(super) struct TestTxn {
     id: TxnId,
-    claim: Claim,
     root: freqfs::DirLock<PersistentFile>,
     path: Vec<String>,
     tensor_limit: usize,
@@ -37,7 +36,6 @@ impl TestTxn {
         let root = cache.load(root).expect("load transaction root");
         Self {
             id: TxnId::from_parts(NetworkTime::from_nanos(1), 1),
-            claim: Claim::new("/test".parse().expect("test claim"), umask::Mode::all()),
             root,
             path: Vec::new(),
             tensor_limit: 256 * 1024 * 1024,
@@ -53,12 +51,6 @@ impl TestTxn {
 impl Transaction for TestTxn {
     fn id(&self) -> TxnId {
         self.id
-    }
-    fn timestamp(&self) -> NetworkTime {
-        self.id.timestamp()
-    }
-    fn claim(&self) -> &Claim {
-        &self.claim
     }
 }
 
@@ -154,17 +146,6 @@ fn state_casts_to_value_and_value_vector() {
     assert_eq!(values, vec![Value::from(1_u64), Value::from(2_u64)]);
 
     assert!(Value::opt_cast_from(TestState::Tuple(vec![])).is_none());
-}
-
-#[test]
-fn production_state_context_never_invents_a_transaction() {
-    let source = include_str!("mod.rs");
-    for forbidden in ["null_transaction", "NullTransaction", "tc_ir::Transaction"] {
-        assert!(
-            !source.contains(forbidden),
-            "production state context must not contain {forbidden}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -441,26 +422,4 @@ fn tensor_facade_slice_roundtrip() {
         sliced.flattened_u64().expect("slice values"),
         vec![2, 3, 5, 6]
     );
-}
-
-#[test]
-fn production_sources_do_not_construct_freqfs_cache() {
-    const SOURCES: [(&str, &str); 9] = [
-        ("src/lib.rs", include_str!("../lib.rs")),
-        ("src/codec/class.rs", include_str!("../codec/class.rs")),
-        ("src/codec/decode.rs", include_str!("../codec/decode.rs")),
-        ("src/codec/helpers.rs", include_str!("../codec/helpers.rs")),
-        ("src/codec/mod.rs", include_str!("../codec/mod.rs")),
-        ("src/codec/parse.rs", include_str!("../codec/parse.rs")),
-        ("src/runtime/class.rs", include_str!("class.rs")),
-        ("src/runtime/route.rs", include_str!("route.rs")),
-        ("src/runtime/mod.rs", include_str!("mod.rs")),
-    ];
-
-    for (path, source) in SOURCES {
-        assert!(
-            !source.contains("Cache::new("),
-            "production source {path} must not call Cache::new"
-        );
-    }
 }

@@ -56,6 +56,7 @@ pub trait StateExecutor: tc_collection::StorageContext + Sized + 'static {
         definition: OpDef,
         args: State<Self>,
         subject: Option<State<Self>>,
+        declared_by: Option<Link>,
     ) -> impl Future<Output = tc_error::TCResult<State<Self>>> + Send;
 }
 
@@ -470,7 +471,7 @@ struct InstanceHandler<Txn: StateExecutor> {
 
 enum OwnedMember<Txn: tc_collection::StorageContext> {
     State(State<Txn>),
-    Method(OpDef),
+    Method(Link, OpDef),
     Parent,
 }
 
@@ -511,9 +512,11 @@ impl<Txn: StateExecutor> InstanceHandler<Txn> {
             Ok(super::ResolvedMember::Scalar { value, .. }) => {
                 OwnedMember::State(State::from_scalar(value.clone()))
             }
-            Ok(super::ResolvedMember::BoundMethod { definition, .. }) => {
-                OwnedMember::Method(definition.clone())
-            }
+            Ok(super::ResolvedMember::BoundMethod {
+                declared_by,
+                definition,
+                ..
+            }) => OwnedMember::Method(declared_by.clone(), definition.clone()),
             Err(super::ClassError::MissingMember { .. }) => OwnedMember::Parent,
             Err(error) => return Err(tc_error::TCError::bad_request(error.to_string())),
         };
@@ -529,16 +532,21 @@ impl<Txn: StateExecutor> InstanceHandler<Txn> {
         match member {
             OwnedMember::State(state) if suffix.is_empty() => Ok(state),
             OwnedMember::State(state) => state.get(txn, suffix, key).await,
-            OwnedMember::Method(definition)
+            OwnedMember::Method(declared_by, definition)
                 if suffix.is_empty() && matches!(definition, OpDef::Get(_)) =>
             {
-                txn.execute_op(definition, State::from_scalar(key), Some(self.subject()))
-                    .await
+                txn.execute_op(
+                    definition,
+                    State::from_scalar(key),
+                    Some(self.subject()),
+                    Some(declared_by),
+                )
+                .await
             }
-            OwnedMember::Method(_) if suffix.is_empty() => Err(
+            OwnedMember::Method(_, _) if suffix.is_empty() => Err(
                 tc_error::TCError::method_not_allowed(tc_ir::Method::Get, "Class method"),
             ),
-            OwnedMember::Method(_) => Err(tc_error::TCError::not_found(path_string(&self.path))),
+            OwnedMember::Method(_, _) => Err(tc_error::TCError::not_found(path_string(&self.path))),
             OwnedMember::Parent => self.instance.parent().get(txn, &self.path, key).await,
         }
     }
@@ -547,21 +555,22 @@ impl<Txn: StateExecutor> InstanceHandler<Txn> {
         let (member, suffix) = self.member(txn).await?;
         match member {
             OwnedMember::State(state) => state.put(txn, suffix, key, value).await,
-            OwnedMember::Method(definition)
+            OwnedMember::Method(declared_by, definition)
                 if suffix.is_empty() && matches!(definition, OpDef::Put(_)) =>
             {
                 txn.execute_op(
                     definition,
                     State::Tuple(vec![State::from_scalar(key), value]),
                     Some(self.subject()),
+                    Some(declared_by),
                 )
                 .await
-                .map(drop)
+                .map(|_| ())
             }
-            OwnedMember::Method(_) if suffix.is_empty() => Err(
+            OwnedMember::Method(_, _) if suffix.is_empty() => Err(
                 tc_error::TCError::method_not_allowed(tc_ir::Method::Put, "Class method"),
             ),
-            OwnedMember::Method(_) => Err(tc_error::TCError::not_found(path_string(&self.path))),
+            OwnedMember::Method(_, _) => Err(tc_error::TCError::not_found(path_string(&self.path))),
             OwnedMember::Parent => {
                 self.instance
                     .parent()
@@ -575,16 +584,21 @@ impl<Txn: StateExecutor> InstanceHandler<Txn> {
         let (member, suffix) = self.member(txn).await?;
         match member {
             OwnedMember::State(state) => state.post(txn, suffix, params).await,
-            OwnedMember::Method(definition)
+            OwnedMember::Method(declared_by, definition)
                 if suffix.is_empty() && matches!(definition, OpDef::Post(_)) =>
             {
-                txn.execute_op(definition, State::Map(params), Some(self.subject()))
-                    .await
+                txn.execute_op(
+                    definition,
+                    State::Map(params),
+                    Some(self.subject()),
+                    Some(declared_by),
+                )
+                .await
             }
-            OwnedMember::Method(_) if suffix.is_empty() => Err(
+            OwnedMember::Method(_, _) if suffix.is_empty() => Err(
                 tc_error::TCError::method_not_allowed(tc_ir::Method::Post, "Class method"),
             ),
-            OwnedMember::Method(_) => Err(tc_error::TCError::not_found(path_string(&self.path))),
+            OwnedMember::Method(_, _) => Err(tc_error::TCError::not_found(path_string(&self.path))),
             OwnedMember::Parent => self.instance.parent().post(txn, &self.path, params).await,
         }
     }
@@ -593,17 +607,22 @@ impl<Txn: StateExecutor> InstanceHandler<Txn> {
         let (member, suffix) = self.member(txn).await?;
         match member {
             OwnedMember::State(state) => state.delete(txn, suffix, key).await,
-            OwnedMember::Method(definition)
+            OwnedMember::Method(declared_by, definition)
                 if suffix.is_empty() && matches!(definition, OpDef::Delete(_)) =>
             {
-                txn.execute_op(definition, State::from_scalar(key), Some(self.subject()))
-                    .await
-                    .map(drop)
+                txn.execute_op(
+                    definition,
+                    State::from_scalar(key),
+                    Some(self.subject()),
+                    Some(declared_by),
+                )
+                .await
+                .map(|_| ())
             }
-            OwnedMember::Method(_) if suffix.is_empty() => Err(
+            OwnedMember::Method(_, _) if suffix.is_empty() => Err(
                 tc_error::TCError::method_not_allowed(tc_ir::Method::Delete, "Class method"),
             ),
-            OwnedMember::Method(_) => Err(tc_error::TCError::not_found(path_string(&self.path))),
+            OwnedMember::Method(_, _) => Err(tc_error::TCError::not_found(path_string(&self.path))),
             OwnedMember::Parent => self.instance.parent().delete(txn, &self.path, key).await,
         }
     }
@@ -968,7 +987,7 @@ async fn fold<Txn: StateExecutor>(
         let mut call = state_params(state)?;
         call.insert(item_name.clone(), item);
         state = txn
-            .execute_op(op.clone(), State::Map(call), Some(subject.clone()))
+            .execute_op(op.clone(), State::Map(call), Some(subject.clone()), None)
             .await?;
     }
     Ok(state)
@@ -1147,6 +1166,7 @@ mod tests {
             definition: OpDef,
             _args: State<Self>,
             _subject: Option<State<Self>>,
+            _declared_by: Option<Link>,
         ) -> tc_error::TCResult<State<Self>> {
             Ok(State::Scalar(Scalar::Op(definition)))
         }
@@ -1228,7 +1248,10 @@ mod tests {
         let mut prototype = Map::new();
         prototype.insert(
             "call".parse().expect("method name"),
-            Scalar::Op(OpDef::Post(Vec::new())),
+            Scalar::Op(OpDef::Post(vec![(
+                "result".parse().unwrap(),
+                Scalar::default(),
+            )])),
         );
         let class = ClassDef::new(
             identity,

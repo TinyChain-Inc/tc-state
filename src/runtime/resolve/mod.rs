@@ -372,7 +372,7 @@ async fn resolve_cond<Txn: StateExecutor>(
     match branch {
         Scalar::Op(op_def) => {
             let params = values_to_params_for_opdef(values, &op_def);
-            txn.execute_op(op_def, State::Map(params), self_link.cloned())
+            txn.execute_op(op_def, State::Map(params), self_link.cloned(), None)
                 .await
         }
         scalar => resolve_scalar(scalar, values, txn, self_link).await,
@@ -416,6 +416,7 @@ async fn resolve_while<Txn: StateExecutor>(
                 cond_def.clone(),
                 State::Map(while_params(state.clone())?),
                 self_link.cloned(),
+                None,
             )
             .await?;
 
@@ -430,6 +431,7 @@ async fn resolve_while<Txn: StateExecutor>(
                 closure_def.clone(),
                 State::Map(while_params(state)?),
                 self_link.cloned(),
+                None,
             )
             .await?;
     }
@@ -458,7 +460,7 @@ async fn resolve_for_each<Txn: StateExecutor>(
         let mut params = Map::new();
         params.insert(item_name.clone(), item);
         last_state = Some(
-            txn.execute_op(op_def.clone(), State::Map(params), self_link.cloned())
+            txn.execute_op(op_def.clone(), State::Map(params), self_link.cloned(), None)
                 .await?,
         );
     }
@@ -527,7 +529,7 @@ fn tuple_state_to_items<Txn: tc_collection::StorageContext>(
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use tc_ir::{Claim, NetworkTime, Transaction, TxnId};
+    use tc_ir::{Transaction, TxnId};
 
     use super::*;
     use crate::runtime::tests::TestTxn;
@@ -552,14 +554,6 @@ mod tests {
     impl Transaction for MockTxn {
         fn id(&self) -> TxnId {
             self.storage.id()
-        }
-
-        fn timestamp(&self) -> NetworkTime {
-            self.storage.timestamp()
-        }
-
-        fn claim(&self) -> &Claim {
-            self.storage.claim()
         }
     }
 
@@ -621,6 +615,7 @@ mod tests {
             _definition: OpDef,
             _args: State<Self>,
             subject: Option<State<Self>>,
+            _declared_by: Option<Link>,
         ) -> TCResult<State<Self>> {
             self.subjects.lock().expect("subjects").push(subject);
             Ok(State::None)
@@ -644,7 +639,10 @@ mod tests {
                 Subject::Link("/lib/example-devco/flag/1.0.0".parse().expect("flag")),
                 Scalar::default(),
             ))),
-            Scalar::Op(OpDef::Post(Vec::new())),
+            Scalar::Op(OpDef::Post(vec![(
+                "result".parse().unwrap(),
+                Scalar::default(),
+            )])),
             Scalar::default(),
         )));
         resolve_ref(cond, &txn, Some(subject.clone()))

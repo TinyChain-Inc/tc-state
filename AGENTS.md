@@ -20,6 +20,10 @@
   implementation is the sole terminal projection walk and delegates collection
   leaves to `tc-collection`; local routes and `OpDef`s exchange `State` without
   constructing a view.
+- `StateExecutor` is trusted host SPI, not an untrusted program interface. A
+  declaring-Class origin is supplied only by canonical Class/member routing and
+  is never decoded from State or IR. Host implementations remain responsible
+  for deadlines, execution budgets, scheduling, and outbound authorization.
 - Every `State<Txn>` signature must name its transaction capability explicitly.
   Do not add a default transaction type or use `State<()>` as a general runtime value;
   transaction-free scalar structure belongs in `tc_ir::Scalar`, not a partially
