@@ -699,6 +699,11 @@ where
                                     as Box<dyn Handler<'a, State<Txn>>>
                             });
                         }
+                        if suffix.is_empty()
+                            && !matches!(member, State::Chain(_) | State::Collection(_))
+                        {
+                            return Some(Box::new(MemberValue(member.clone())));
+                        }
                         return member.route(suffix);
                     }
                 }
@@ -713,6 +718,17 @@ macro_rules! route_handler {
     ($handler:ident, $subject:expr) => {
         Some(Box::new($handler($subject)) as Box<dyn Handler<'_, State<Txn>>>)
     };
+}
+
+struct MemberValue<Txn: tc_collection::StorageContext>(State<Txn>);
+
+impl<'a, Txn: StateExecutor> Handler<'a, State<Txn>> for MemberValue<Txn> {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_, _| Box::pin(async move { Ok(self.0) })))
+    }
 }
 
 /// An immutable operation definition bound to its native `$self` value.
