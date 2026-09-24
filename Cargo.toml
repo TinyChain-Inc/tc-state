@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+tc-chain = { path = "../tc-chain" }
 async-hash = { path = "../deps/async-hash", version = "0.6" }
 bytes = "1"
 destream = { path = "../deps/destream", version = "0.10" }

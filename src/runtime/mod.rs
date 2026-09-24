@@ -12,7 +12,7 @@ use tc_value::Value;
 mod class;
 pub use class::*;
 mod route;
-pub use route::{StateExecutor, Static};
+pub use route::{BoundMethod, StateExecutor, Static};
 mod resolve;
 pub use resolve::{resolve_ref, resolve_scalar as resolve};
 
@@ -22,14 +22,29 @@ pub use tc_collection::Collection;
 pub use tc_value::class::{Class, NativeClass};
 
 /// TinyChain runtime state.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum State<Txn: tc_collection::StorageContext> {
     None,
     Scalar(Scalar),
     Map(Map<State<Txn>>),
     Tuple(Vec<State<Txn>>),
     Collection(Collection<Txn>),
+    Chain(tc_chain::SyncChain<Txn, Txn::File>),
     Object(Box<Object<Txn>>),
+}
+
+impl<Txn: tc_collection::StorageContext + std::fmt::Debug> std::fmt::Debug for State<Txn> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::Scalar(value) => f.debug_tuple("Scalar").field(value).finish(),
+            Self::Map(value) => f.debug_tuple("Map").field(value).finish(),
+            Self::Tuple(value) => f.debug_tuple("Tuple").field(value).finish(),
+            Self::Collection(value) => f.debug_tuple("Collection").field(value).finish(),
+            Self::Chain(value) => f.debug_tuple("Chain").field(value).finish(),
+            Self::Object(value) => f.debug_tuple("Object").field(value).finish(),
+        }
+    }
 }
 
 impl<Txn: tc_collection::StorageContext> State<Txn> {
@@ -187,6 +202,25 @@ impl<Txn: tc_collection::StorageContext> From<Collection<Txn>> for State<Txn> {
     }
 }
 
+impl<Txn: tc_collection::StorageContext> From<tc_chain::SyncChain<Txn, Txn::File>> for State<Txn> {
+    fn from(chain: tc_chain::SyncChain<Txn, Txn::File>) -> Self {
+        Self::Chain(chain)
+    }
+}
+
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Collection<Txn> {
+    fn can_cast_from(state: &State<Txn>) -> bool {
+        matches!(state, State::Collection(_))
+    }
+
+    fn opt_cast_from(state: State<Txn>) -> Option<Self> {
+        match state {
+            State::Collection(collection) => Some(collection),
+            _ => None,
+        }
+    }
+}
+
 impl<Txn: tc_collection::StorageContext> From<Object<Txn>> for State<Txn> {
     fn from(object: Object<Txn>) -> Self {
         State::Object(Box::new(object))
@@ -205,7 +239,7 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Scalar {
             State::None | State::Scalar(_) => true,
             State::Map(map) => map.values().all(Self::can_cast_from),
             State::Tuple(items) => items.iter().all(Self::can_cast_from),
-            State::Collection(_) | State::Object(_) => false,
+            State::Collection(_) | State::Chain(_) | State::Object(_) => false,
         }
     }
 
@@ -223,7 +257,7 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Scalar {
                 .map(Self::opt_cast_from)
                 .collect::<Option<Vec<_>>>()
                 .map(Scalar::Tuple),
-            State::Collection(_) | State::Object(_) => None,
+            State::Collection(_) | State::Chain(_) | State::Object(_) => None,
         }
     }
 }

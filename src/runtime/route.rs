@@ -377,9 +377,9 @@ fn scalar_from_state<Txn: tc_collection::StorageContext>(
             .map(scalar_from_state)
             .collect::<tc_error::TCResult<Vec<_>>>()
             .map(Scalar::Tuple),
-        State::Collection(_) | State::Object(_) => Err(tc_error::TCError::bad_request(
-            "expected a scalar state request",
-        )),
+        State::Collection(_) | State::Chain(_) | State::Object(_) => Err(
+            tc_error::TCError::bad_request("expected a scalar state request"),
+        ),
     }
 }
 
@@ -677,6 +677,7 @@ where
     fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, State<Txn>> + 'a>> {
         match self {
             Self::Collection(collection) => collection.route(path),
+            Self::Chain(chain) => chain.route(path),
             Self::Object(object) => object.route(path),
             Self::None => None,
             Self::Scalar(Scalar::Tuple(_)) => TupleRoute(self.clone()).handler(path),
@@ -689,7 +690,20 @@ where
             }
             Self::Scalar(Scalar::Value(_)) => ValueRoute(self.clone()).handler(path),
             Self::Scalar(_) => None,
-            Self::Map(_) => MapRoute(self.clone()).handler(path),
+            Self::Map(members) => {
+                if let Some((name, suffix)) = path.split_first() {
+                    if let Some(member) = members.get(name.as_str()) {
+                        if let State::Scalar(Scalar::Op(definition)) = member {
+                            return suffix.is_empty().then(|| {
+                                Box::new(BoundMethod::new(self.clone(), definition.clone()))
+                                    as Box<dyn Handler<'a, State<Txn>>>
+                            });
+                        }
+                        return member.route(suffix);
+                    }
+                }
+                MapRoute(self.clone()).handler(path)
+            }
             Self::Tuple(_) => TupleRoute(self.clone()).handler(path),
         }
     }
@@ -699,6 +713,110 @@ macro_rules! route_handler {
     ($handler:ident, $subject:expr) => {
         Some(Box::new($handler($subject)) as Box<dyn Handler<'_, State<Txn>>>)
     };
+}
+
+/// An immutable operation definition bound to its native `$self` value.
+#[derive(Clone)]
+pub struct BoundMethod<Txn: tc_collection::StorageContext> {
+    subject: State<Txn>,
+    definition: OpDef,
+}
+
+impl<Txn: tc_collection::StorageContext> BoundMethod<Txn> {
+    pub fn new(subject: State<Txn>, definition: OpDef) -> Self {
+        Self {
+            subject,
+            definition,
+        }
+    }
+}
+
+impl<'a, Txn: StateExecutor> Handler<'a, State<Txn>> for BoundMethod<Txn> {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Get(_)).then(|| {
+            Box::new(move |txn, key| {
+                Box::pin(async move {
+                    let subject = self.subject.clone();
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::from_scalar(key),
+                        Some(subject),
+                        None,
+                    )
+                    .await
+                }) as tc_ir::HandlerFuture<'a, State<Txn>>
+            }) as GetHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Put(_)).then(|| {
+            Box::new(move |txn, key, value| {
+                Box::pin(async move {
+                    let subject = self.subject.clone();
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::Tuple(vec![State::from_scalar(key), value]),
+                        Some(subject),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }) as tc_ir::HandlerFuture<'a, ()>
+            }) as PutHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn post<'txn>(self: Box<Self>) -> Option<PostHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Post(_)).then(|| {
+            Box::new(move |txn, params| {
+                Box::pin(async move {
+                    let subject = self.subject.clone();
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::Map(params),
+                        Some(subject),
+                        None,
+                    )
+                    .await
+                }) as tc_ir::HandlerFuture<'a, State<Txn>>
+            }) as PostHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Delete(_)).then(|| {
+            Box::new(move |txn, key| {
+                Box::pin(async move {
+                    let subject = self.subject.clone();
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::from_scalar(key),
+                        Some(subject),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }) as tc_ir::HandlerFuture<'a, ()>
+            }) as DeleteHandler<'a, 'txn, State<Txn>>
+        })
+    }
 }
 
 struct ValueRoute<Txn: tc_collection::StorageContext>(State<Txn>);

@@ -10,10 +10,15 @@ and codec boundary without owning host storage or transports.
 - Recursive resolution of `Scalar`, `TCRef`, operation parameters, control flow,
   and concrete `$self` values.
 - Native routing for scalar values, tuples, maps, objects, Classes, and delegated
-  collections.
+  collections and Chain-owned members.
 - Canonical Class construction, digest verification, inheritance, cycle/depth
   validation, and declaring-Class method ownership.
 - Recursive transaction-consistent view acquisition before adapter encoding.
+
+`State::Chain` preserves the WAL boundary during native method execution. Its
+terminal view delegates to the collection view; no additional wire envelope is
+introduced. `BoundMethod` executes an existing `OpDef` with its native `$self`;
+maps recursively delegate member routes without discarding a Chain owner.
 
 Collection behavior belongs to `tc-collection`. `tc-ir` reports syntax-level
 requirements but owns no execution plan; graph scheduling and `OpDef` execution

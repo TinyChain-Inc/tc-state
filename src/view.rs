@@ -51,6 +51,7 @@ where
             State::Collection(collection) => {
                 collection.into_view(txn).await.map(StateView::Collection)
             }
+            State::Chain(chain) => chain.into_view(txn).await.map(StateView::Collection),
             State::Object(object) => match *object {
                 Object::Class(class) => Ok(StateView::Object(ObjectView::Class(class))),
                 Object::Instance(instance) => instance_view(instance, txn).await,
