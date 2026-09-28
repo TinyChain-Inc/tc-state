@@ -12,7 +12,7 @@ use tc_value::Value;
 mod class;
 pub use class::*;
 mod route;
-pub use route::{BoundMethod, StateExecutor, Static};
+pub use route::{route_scalar, BoundMethod, StateExecutor, Static};
 mod resolve;
 pub use resolve::{resolve_ref, resolve_scalar as resolve};
 

@@ -19,6 +19,9 @@ and codec boundary without owning host storage or transports.
 terminal view delegates to the collection view; no additional wire envelope is
 introduced. `BoundMethod` executes an existing `OpDef` with its native `$self`;
 maps recursively delegate member routes without discarding a Chain owner.
+`route_scalar(&scalar, || subject)` selects application scalar handlers and
+constructs the subject only for a method. Its operation-reference GET evaluates
+the reference; native map member observations continue returning reference values.
 
 Collection behavior belongs to `tc-collection`. `tc-ir` reports syntax-level
 requirements but owns no execution plan; graph scheduling and `OpDef` execution
