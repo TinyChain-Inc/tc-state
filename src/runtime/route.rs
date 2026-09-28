@@ -377,9 +377,9 @@ fn scalar_from_state<Txn: tc_collection::StorageContext>(
             .map(scalar_from_state)
             .collect::<tc_error::TCResult<Vec<_>>>()
             .map(Scalar::Tuple),
-        State::Collection(_) | State::Object(_) => Err(tc_error::TCError::bad_request(
-            "expected a scalar state request",
-        )),
+        State::Collection(_) | State::Chain(_) | State::Object(_) => Err(
+            tc_error::TCError::bad_request("expected a scalar state request"),
+        ),
     }
 }
 
@@ -677,6 +677,7 @@ where
     fn route<'a>(&'a self, path: &[PathSegment]) -> Option<Box<dyn Handler<'a, State<Txn>> + 'a>> {
         match self {
             Self::Collection(collection) => collection.route(path),
+            Self::Chain(chain) => chain.route(path),
             Self::Object(object) => object.route(path),
             Self::None => None,
             Self::Scalar(Scalar::Tuple(_)) => TupleRoute(self.clone()).handler(path),
@@ -689,7 +690,25 @@ where
             }
             Self::Scalar(Scalar::Value(_)) => ValueRoute(self.clone()).handler(path),
             Self::Scalar(_) => None,
-            Self::Map(_) => MapRoute(self.clone()).handler(path),
+            Self::Map(members) => {
+                if let Some((name, suffix)) = path.split_first() {
+                    if let Some(member) = members.get(name.as_str()) {
+                        if let State::Scalar(Scalar::Op(definition)) = member {
+                            return suffix.is_empty().then(|| {
+                                Box::new(BoundMethod::new(self.clone(), definition.clone()))
+                                    as Box<dyn Handler<'a, State<Txn>>>
+                            });
+                        }
+                        if suffix.is_empty()
+                            && !matches!(member, State::Chain(_) | State::Collection(_))
+                        {
+                            return Some(Box::new(MemberValue(member.clone())));
+                        }
+                        return member.route(suffix);
+                    }
+                }
+                MapRoute(self.clone()).handler(path)
+            }
             Self::Tuple(_) => TupleRoute(self.clone()).handler(path),
         }
     }
@@ -699,6 +718,148 @@ macro_rules! route_handler {
     ($handler:ident, $subject:expr) => {
         Some(Box::new($handler($subject)) as Box<dyn Handler<'_, State<Txn>>>)
     };
+}
+
+struct MemberValue<Txn: tc_collection::StorageContext>(State<Txn>);
+
+impl<'a, Txn: StateExecutor> Handler<'a, State<Txn>> for MemberValue<Txn> {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |_, _| Box::pin(async move { Ok(self.0) })))
+    }
+}
+
+/// Route a scalar application attribute, constructing its native `$self` only
+/// when binding an operation definition. Operation references evaluate on GET;
+/// other references remain literal values. Native map observations keep their
+/// own value-returning semantics.
+pub fn route_scalar<'a, Txn: StateExecutor>(
+    scalar: &Scalar,
+    subject: impl FnOnce() -> State<Txn>,
+) -> Box<dyn Handler<'a, State<Txn>> + 'a> {
+    match scalar.clone() {
+        Scalar::Op(definition) => Box::new(BoundMethod::new(subject(), definition)),
+        Scalar::Ref(reference) => match *reference {
+            tc_ir::TCRef::Op(op) => Box::new(RefHandler(op)),
+            reference => Box::new(MemberValue(State::from(Scalar::from(reference)))),
+        },
+        value => Box::new(MemberValue(State::from_scalar(value))),
+    }
+}
+
+struct RefHandler(tc_ir::OpRef);
+
+impl<'a, Txn: StateExecutor> Handler<'a, State<Txn>> for RefHandler {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        Some(Box::new(move |txn, _key| {
+            super::resolve_ref(tc_ir::TCRef::Op(self.0), txn, None)
+        }))
+    }
+}
+
+/// An immutable operation definition bound to its native `$self` value.
+#[derive(Clone)]
+pub struct BoundMethod<Txn: tc_collection::StorageContext> {
+    subject: State<Txn>,
+    definition: OpDef,
+}
+
+impl<Txn: tc_collection::StorageContext> BoundMethod<Txn> {
+    pub fn new(subject: State<Txn>, definition: OpDef) -> Self {
+        Self {
+            subject,
+            definition,
+        }
+    }
+}
+
+impl<'a, Txn: StateExecutor> Handler<'a, State<Txn>> for BoundMethod<Txn> {
+    fn get<'txn>(self: Box<Self>) -> Option<GetHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Get(_)).then(|| {
+            Box::new(move |txn, key| {
+                Box::pin(async move {
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::from_scalar(key),
+                        Some(self.subject),
+                        None,
+                    )
+                    .await
+                }) as tc_ir::HandlerFuture<'a, State<Txn>>
+            }) as GetHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn put<'txn>(self: Box<Self>) -> Option<PutHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Put(_)).then(|| {
+            Box::new(move |txn, key, value| {
+                Box::pin(async move {
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::Tuple(vec![State::from_scalar(key), value]),
+                        Some(self.subject),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }) as tc_ir::HandlerFuture<'a, ()>
+            }) as PutHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn post<'txn>(self: Box<Self>) -> Option<PostHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Post(_)).then(|| {
+            Box::new(move |txn, params| {
+                Box::pin(async move {
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::Map(params),
+                        Some(self.subject),
+                        None,
+                    )
+                    .await
+                }) as tc_ir::HandlerFuture<'a, State<Txn>>
+            }) as PostHandler<'a, 'txn, State<Txn>>
+        })
+    }
+
+    fn delete<'txn>(self: Box<Self>) -> Option<DeleteHandler<'a, 'txn, State<Txn>>>
+    where
+        'txn: 'a,
+    {
+        matches!(self.definition, OpDef::Delete(_)).then(|| {
+            Box::new(move |txn, key| {
+                Box::pin(async move {
+                    StateExecutor::execute_op(
+                        txn,
+                        self.definition,
+                        State::from_scalar(key),
+                        Some(self.subject),
+                        None,
+                    )
+                    .await
+                    .map(|_| ())
+                }) as tc_ir::HandlerFuture<'a, ()>
+            }) as DeleteHandler<'a, 'txn, State<Txn>>
+        })
+    }
 }
 
 struct ValueRoute<Txn: tc_collection::StorageContext>(State<Txn>);
@@ -1169,6 +1330,91 @@ mod tests {
             _declared_by: Option<Link>,
         ) -> tc_error::TCResult<State<Self>> {
             Ok(State::Scalar(Scalar::Op(definition)))
+        }
+    }
+
+    #[tokio::test]
+    async fn scalar_attributes_construct_subjects_only_for_methods() {
+        use std::cell::Cell;
+
+        use safecast::TryCastFrom;
+        use tc_ir::{IdRef, OpRef, Subject, TCRef};
+
+        let txn = TestTxn::new();
+        let literal = Scalar::from(TCRef::Id(IdRef::new("literal".parse().unwrap())));
+        for scalar in [Scalar::default(), Scalar::from(42_u64), literal] {
+            let result = route_scalar(&scalar, || panic!("unused subject"))
+                .get()
+                .unwrap()(&txn, Scalar::default())
+            .await
+            .unwrap();
+            assert_eq!(Scalar::opt_cast_from(result), Some(scalar));
+        }
+
+        let reference = Scalar::from(TCRef::Op(OpRef::Get((
+            Subject::Link("/lib/test/missing/1.0.0".parse().unwrap()),
+            Scalar::default(),
+        ))));
+        let error = route_scalar(&reference, || panic!("unused subject"))
+            .get()
+            .unwrap()(&txn, Scalar::default())
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("test target"));
+
+        let nested = State::Map(
+            [(
+                "value".parse().unwrap(),
+                State::from_scalar(reference.clone()),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let map = State::Map([("nested".parse().unwrap(), nested)].into_iter().collect());
+        let result = map
+            .get(
+                &txn,
+                &["nested".parse().unwrap(), "value".parse().unwrap()],
+                Scalar::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(Scalar::opt_cast_from(result), Some(reference));
+
+        let key: tc_ir::Id = "key".parse().unwrap();
+        for op in [
+            OpDef::Get((key.clone(), vec![])),
+            OpDef::Put((key.clone(), "value".parse().unwrap(), vec![])),
+            OpDef::Post(vec![]),
+            OpDef::Delete((key, vec![])),
+        ] {
+            let calls = Cell::new(0);
+            let handler = route_scalar(&Scalar::Op(op.clone()), || {
+                calls.set(calls.get() + 1);
+                State::from(42_u64)
+            });
+            assert_eq!(calls.get(), 1);
+            match op {
+                OpDef::Get(_) => {
+                    handler.get().unwrap()(&txn, Scalar::default())
+                        .await
+                        .unwrap();
+                }
+                OpDef::Put(_) => {
+                    handler.put().unwrap()(&txn, Scalar::default(), State::None)
+                        .await
+                        .unwrap();
+                }
+                OpDef::Post(_) => {
+                    handler.post().unwrap()(&txn, Map::new()).await.unwrap();
+                }
+                OpDef::Delete(_) => {
+                    handler.delete().unwrap()(&txn, Scalar::default())
+                        .await
+                        .unwrap();
+                }
+            }
+            assert_eq!(calls.get(), 1);
         }
     }
 

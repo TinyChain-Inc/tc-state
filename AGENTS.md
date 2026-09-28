@@ -53,8 +53,8 @@
   decoding receives only a kernel-delegated collection allocation context; it does
   not receive filesystem paths, construct roots, or retain a transaction ID/handle.
   Literal and transaction-local BTree/Table values receive delegated allocation
-  children. Persistent named collections remain unsupported until Service and
-  Chain own them. Any cache construction in this crate must be limited to
+  children. Persistent named members retain their Chain owner in State; State
+  does not host standalone collections. Any cache construction in this crate must be limited to
   `#[cfg(test)]` helpers.
 - State and collection leaves use only allocation contexts delegated by their
   caller. They do not know or select a host data or workspace root. The parent
