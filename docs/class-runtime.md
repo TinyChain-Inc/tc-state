@@ -43,10 +43,11 @@ which declared it.
 
 ## Runtime boundary
 
-`StateExecutor` is the only host capability required by recursive State
-execution. It provides canonical Class lookup, outbound dispatch, and the
-callback for server-owned `OpDef` execution. The state layer preserves the
-transaction, deadline, method call, declaring-Class origin, and concrete
+Recursive State execution requires `OpExecutor: Gateway`. `Gateway` provides
+canonical Class lookup, outbound dispatch, and the inherited write-scope check;
+`OpExecutor` adds only the call to server-owned `OpDef` execution. Resource
+owners retain authorization, and the server retains scheduling. The state layer
+preserves the transaction, deadline, method call, declaring-Class origin, and concrete
 subject; it does not aggregate application policy, schedule graphs, or choose
 transaction outcomes.
 
@@ -60,5 +61,5 @@ instance ID, or registry membership.
 Changes require deterministic Class and instance round trips plus tests for
 member precedence, bound `$self`, native-parent delegation, declaring-Class
 ownership, malformed definitions, cycles, and depth limits. A mocked
-`StateExecutor` must demonstrate that nested dispatch preserves transaction and
+`OpExecutor` must demonstrate that nested dispatch preserves transaction and
 subject identity.
