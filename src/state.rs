@@ -1,27 +1,17 @@
-//! TinyChain state runtime primitives.
-//!
-//! BTree decode consumes transaction-local roots delegated by the host. This
-//! crate does not construct `freqfs::Cache` or transaction directories.
+//! Universal State values and their canonical conversions.
 
 use number_general::Number;
 use safecast::TryCastFrom;
+use tc_collection::Collection;
 use tc_collection::table::Table;
+use tc_collection::tensor::Tensor;
 use tc_ir::{Map, Scalar};
 use tc_value::Value;
 
-mod class;
-pub use class::*;
-mod route;
-pub use route::{route_scalar, BoundMethod, StateExecutor, Static};
-mod resolve;
-pub use resolve::{resolve_ref, resolve_scalar as resolve};
+use crate::Object;
 
-pub use crate::codec::{BTreeType, CollectionType, ObjectType, StateType, TableType, TensorType};
-pub use tc_collection::tensor::{AxisRange, Range, Tensor, TensorReduceResult};
-pub use tc_collection::Collection;
-pub use tc_value::class::{Class, NativeClass};
-
-/// TinyChain runtime state.
+/// TinyChain runtime state with ordinary recursive ownership.
+/// Native construction must respect the codec's structural nesting contract.
 #[derive(Clone)]
 pub enum State<Txn: tc_collection::StorageContext> {
     None,
@@ -38,35 +28,76 @@ impl<Txn: tc_collection::StorageContext + std::fmt::Debug> std::fmt::Debug for S
         match self {
             Self::None => f.write_str("None"),
             Self::Scalar(value) => f.debug_tuple("Scalar").field(value).finish(),
-            Self::Map(value) => f.debug_tuple("Map").field(value).finish(),
+            Self::Map(value) => write!(f, "Map({:?})", **value),
             Self::Tuple(value) => f.debug_tuple("Tuple").field(value).finish(),
             Self::Collection(value) => f.debug_tuple("Collection").field(value).finish(),
             Self::Chain(value) => f.debug_tuple("Chain").field(value).finish(),
-            Self::Object(value) => f.debug_tuple("Object").field(value).finish(),
+            Self::Object(value) => match value.as_ref() {
+                Object::Class(class) => write!(f, "Object(Class({class:?}))"),
+                Object::Instance(instance) => write!(
+                    f,
+                    "Object(Instance {{ parent: {:?}, class: {:?}, members: Map({:?}) }})",
+                    instance.parent(),
+                    instance.class(),
+                    **instance.members()
+                ),
+            },
         }
     }
 }
 
 impl<Txn: tc_collection::StorageContext> State<Txn> {
-    /// Lift a transaction-free IR scalar into its structural State form.
-    pub fn from_scalar(scalar: Scalar) -> Self {
-        match scalar {
-            Scalar::Map(map) => State::Map(
-                map.into_iter()
-                    .map(|(id, value)| (id, Self::from_scalar(value)))
-                    .collect(),
-            ),
-            Scalar::Tuple(items) => {
-                State::Tuple(items.into_iter().map(Self::from_scalar).collect())
+    /// Check native composition against the codec's structural allowance.
+    /// Collections and Chains retain their separately bounded native owners.
+    pub fn within_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::None | Self::Collection(_) | Self::Chain(_) => true,
+            Self::Scalar(value) => value.within_depth(remaining),
+            Self::Map(values) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| values.values().all(|value| value.within_depth(n))),
+            Self::Tuple(values) => remaining
+                .checked_sub(1)
+                .is_some_and(|n| values.iter().all(|value| value.within_depth(n))),
+            Self::Object(object) => {
+                remaining
+                    .checked_sub(1)
+                    .is_some_and(|n| match object.as_ref() {
+                        Object::Class(class) => class.within_depth(n),
+                        Object::Instance(instance) => {
+                            instance.parent().within_depth(n)
+                                && instance.class().within_depth(n)
+                                && n.checked_sub(1).is_some_and(|n| {
+                                    instance
+                                        .members()
+                                        .values()
+                                        .all(|value| value.within_depth(n))
+                                })
+                        }
+                    })
             }
-            scalar => State::Scalar(scalar),
+        }
+    }
+
+    fn within_value_depth(&self, remaining: usize) -> bool {
+        match self {
+            Self::Scalar(scalar) => scalar.within_value_depth(remaining),
+            Self::Tuple(items) => {
+                remaining > 0
+                    && items
+                        .iter()
+                        .all(|item| item.within_value_depth(remaining - 1))
+            }
+            _ => false,
         }
     }
 
     pub fn is_none(&self) -> bool {
-        match self {
+        match &self {
             State::None => true,
-            State::Scalar(Scalar::Value(Value::None)) => true,
+            State::Scalar(scalar) => {
+                matches!(&scalar, tc_ir::Scalar::Value(value) if matches!(&value, tc_value::Value::None))
+            }
             State::Tuple(items) => items.is_empty(),
             _ => false,
         }
@@ -86,26 +117,36 @@ impl<Txn: tc_collection::StorageContext> From<Value> for State<Txn> {
 }
 
 impl<Txn: tc_collection::StorageContext> From<Scalar> for State<Txn> {
+    /// Lift an IR scalar into native structural State through its container variants.
     fn from(scalar: Scalar) -> Self {
-        Self::from_scalar(scalar)
+        match scalar {
+            Scalar::Tuple(items) => Self::Tuple(items.into_iter().map(Self::from).collect()),
+            Scalar::Map(items) => Self::Map(
+                items
+                    .into_iter()
+                    .map(|(id, value)| (id, Self::from(value)))
+                    .collect(),
+            ),
+            scalar => Self::Scalar(scalar),
+        }
     }
 }
 
 impl<Txn: tc_collection::StorageContext> From<Map<State<Txn>>> for State<Txn> {
     fn from(map: Map<State<Txn>>) -> Self {
-        Self::Map(map)
+        State::Map(map)
     }
 }
 
 impl<Txn: tc_collection::StorageContext> From<Vec<State<Txn>>> for State<Txn> {
     fn from(tuple: Vec<State<Txn>>) -> Self {
-        Self::Tuple(tuple)
+        State::Tuple(tuple)
     }
 }
 
 impl<Txn: tc_collection::StorageContext> From<Map<bool>> for State<Txn> {
     fn from(map: Map<bool>) -> Self {
-        Self::Map(
+        State::Map(
             map.into_iter()
                 .map(|(name, value)| (name, Self::from(Number::from(value))))
                 .collect(),
@@ -113,16 +154,44 @@ impl<Txn: tc_collection::StorageContext> From<Map<bool>> for State<Txn> {
     }
 }
 
+// Inspection recognizes the existing numeric variant without coercion or ownership copies.
+impl<Txn: tc_collection::StorageContext> TryCastFrom<&State<Txn>> for Number {
+    fn can_cast_from(state: &&State<Txn>) -> bool {
+        Self::opt_cast_from(*state).is_some()
+    }
+
+    fn opt_cast_from(state: &State<Txn>) -> Option<Self> {
+        match state {
+            State::Scalar(Scalar::Value(value)) => Self::opt_cast_from(value),
+            _ => None,
+        }
+    }
+}
+
 impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Value {
     fn can_cast_from(state: &State<Txn>) -> bool {
-        matches!(state, State::Scalar(Scalar::Value(_)))
+        state.within_value_depth(tc_value::MAX_VALUE_DEPTH)
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
-        match state {
-            State::Scalar(Scalar::Value(value)) => Some(value),
-            _ => None,
+        if !Self::can_cast_from(&state) {
+            return None;
         }
+
+        state_into_value(state)
+    }
+}
+
+// The complete State/Scalar/Value shape has already passed the shared depth checks.
+fn state_into_value<Txn: tc_collection::StorageContext>(state: State<Txn>) -> Option<Value> {
+    match state {
+        State::Scalar(scalar) => Value::opt_cast_from(scalar),
+        State::Tuple(items) => items
+            .into_iter()
+            .map(state_into_value)
+            .collect::<Option<Vec<_>>>()
+            .map(Value::Tuple),
+        _ => None,
     }
 }
 
@@ -130,36 +199,52 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Vec<Value> 
     fn can_cast_from(state: &State<Txn>) -> bool {
         match state {
             State::Tuple(items) => items.iter().all(Value::can_cast_from),
-            State::Scalar(Scalar::Tuple(items)) => {
-                items.iter().all(|item| matches!(item, Scalar::Value(_)))
-            }
-            state => Value::can_cast_from(state),
+            State::Scalar(Scalar::Tuple(items)) => items.iter().all(Value::can_cast_from),
+            _ => Value::can_cast_from(state),
         }
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
         match state {
             State::Tuple(items) => items.into_iter().map(Value::opt_cast_from).collect(),
-            State::Scalar(Scalar::Tuple(items)) => items
-                .into_iter()
-                .map(|item| Value::opt_cast_from(State::<Txn>::Scalar(item)))
-                .collect(),
-            state => Some(vec![Value::opt_cast_from(state)?]),
+            State::Scalar(Scalar::Tuple(items)) => {
+                items.into_iter().map(Value::opt_cast_from).collect()
+            }
+            state => Value::opt_cast_from(state).map(|value| vec![value]),
         }
     }
 }
 
 impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Vec<State<Txn>> {
     fn can_cast_from(state: &State<Txn>) -> bool {
-        matches!(state, State::Tuple(_) | State::Scalar(Scalar::Tuple(_)))
+        match &state {
+            State::Tuple(_) => true,
+            State::Scalar(scalar) => match &scalar {
+                tc_ir::Scalar::Tuple(_) => true,
+                tc_ir::Scalar::Value(value) => {
+                    matches!(&value, tc_value::Value::Tuple(_))
+                }
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
         match state {
             State::Tuple(items) => Some(items),
-            State::Scalar(Scalar::Tuple(items)) => {
-                Some(items.into_iter().map(State::Scalar).collect())
-            }
+            State::Scalar(scalar) => match scalar {
+                tc_ir::Scalar::Tuple(items) => Some(
+                    items
+                        .into_iter()
+                        .map(|scalar| State::Scalar(scalar))
+                        .collect(),
+                ),
+                tc_ir::Scalar::Value(tc_value::Value::Tuple(items)) => {
+                    Some(items.into_iter().map(State::from).collect())
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -167,7 +252,8 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Vec<State<T
 
 impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Map<State<Txn>> {
     fn can_cast_from(state: &State<Txn>) -> bool {
-        matches!(state, State::Map(_) | State::Scalar(Scalar::Map(_)))
+        matches!(&state, State::Map(_))
+            || matches!(&state, State::Scalar(scalar) if matches!(&scalar, tc_ir::Scalar::Map(_)))
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
@@ -183,9 +269,9 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Map<State<T
     }
 }
 
-impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Tensor {
+impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Tensor<Txn> {
     fn can_cast_from(state: &State<Txn>) -> bool {
-        matches!(state, State::Collection(Collection::Tensor(_)))
+        matches!(&state, State::Collection(Collection::Tensor(_)))
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
@@ -204,13 +290,13 @@ impl<Txn: tc_collection::StorageContext> From<Collection<Txn>> for State<Txn> {
 
 impl<Txn: tc_collection::StorageContext> From<tc_chain::SyncChain<Txn, Txn::File>> for State<Txn> {
     fn from(chain: tc_chain::SyncChain<Txn, Txn::File>) -> Self {
-        Self::Chain(chain)
+        State::Chain(chain)
     }
 }
 
 impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Collection<Txn> {
     fn can_cast_from(state: &State<Txn>) -> bool {
-        matches!(state, State::Collection(_))
+        matches!(&state, State::Collection(_))
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
@@ -229,7 +315,7 @@ impl<Txn: tc_collection::StorageContext> From<Object<Txn>> for State<Txn> {
 
 impl<Txn: tc_collection::StorageContext> From<Table<Txn>> for State<Txn> {
     fn from(table: Table<Txn>) -> Self {
-        State::Collection(Collection::from(table))
+        Self::from(Collection::from(table))
     }
 }
 
@@ -237,27 +323,27 @@ impl<Txn: tc_collection::StorageContext> TryCastFrom<State<Txn>> for Scalar {
     fn can_cast_from(state: &State<Txn>) -> bool {
         match state {
             State::None | State::Scalar(_) => true,
-            State::Map(map) => map.values().all(Self::can_cast_from),
             State::Tuple(items) => items.iter().all(Self::can_cast_from),
-            State::Collection(_) | State::Chain(_) | State::Object(_) => false,
+            State::Map(items) => items.values().all(Self::can_cast_from),
+            _ => false,
         }
     }
 
     fn opt_cast_from(state: State<Txn>) -> Option<Self> {
         match state {
-            State::None => Some(Scalar::Value(Value::None)),
+            State::None => Some(Self::default()),
             State::Scalar(scalar) => Some(scalar),
-            State::Map(map) => map
-                .into_iter()
-                .map(|(key, value)| Self::opt_cast_from(value).map(|value| (key, value)))
-                .collect::<Option<Map<_>>>()
-                .map(Scalar::Map),
             State::Tuple(items) => items
                 .into_iter()
                 .map(Self::opt_cast_from)
                 .collect::<Option<Vec<_>>>()
-                .map(Scalar::Tuple),
-            State::Collection(_) | State::Chain(_) | State::Object(_) => None,
+                .map(Self::Tuple),
+            State::Map(items) => items
+                .into_iter()
+                .map(|(id, value)| Self::opt_cast_from(value).map(|value| (id, value)))
+                .collect::<Option<Map<_>>>()
+                .map(Self::Map),
+            _ => None,
         }
     }
 }
@@ -289,10 +375,14 @@ impl<Txn: tc_collection::StorageContext + 'static> tc_collection::CollectionStat
         })
     }
 
-    fn into_tensor(self) -> tc_error::TCResult<Tensor> {
+    fn into_tensor(self) -> tc_error::TCResult<Tensor<Txn>> {
         Tensor::try_cast_from(self, |_| {
             tc_error::TCError::bad_request("expected tensor state")
         })
+    }
+
+    fn as_number(&self) -> Option<Number> {
+        Number::opt_cast_from(self)
     }
 
     fn is_none(&self) -> bool {
@@ -317,4 +407,5 @@ impl<Txn: tc_collection::StorageContext> From<u64> for State<Txn> {
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "../tests/unit/state/tests.rs"]
+pub(crate) mod tests;

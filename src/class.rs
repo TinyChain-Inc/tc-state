@@ -4,7 +4,8 @@ use std::collections::HashSet;
 use std::fmt;
 
 use async_hash::{Digest as AsyncDigest, Hash as AsyncHash, Output};
-use destream::{de, en, EncodeMap, IntoStream};
+use destream::de::FromStream;
+use destream::{de, en, EncodeMap};
 use pathlink::{Link, PathBuf};
 use tc_ir::{Id, Map, Scalar};
 use tc_value::class::NativeClass;
@@ -85,6 +86,7 @@ impl ClassBody {
             ),
             ClassParent::Class(parent) => tc_value::Value::Link(parent.clone()),
         };
+
         Scalar::Map(Map::from_iter([
             ("parent".parse().expect("Class field"), Scalar::from(parent)),
             (
@@ -106,6 +108,7 @@ impl<D: AsyncDigest> AsyncHash<D> for &ClassBody {
             ClassParent::Native(parent) => parent.path().to_string(),
             ClassParent::Class(parent) => parent.to_string(),
         };
+
         AsyncHash::<D>::hash((parent, &self.prototype))
     }
 }
@@ -125,9 +128,11 @@ impl TryFrom<Scalar> for ClassBody {
         let parent = body
             .remove(&parent_key)
             .ok_or_else(|| ClassError::MalformedDefinition("missing Class parent".to_string()))?;
+
         let prototype = body.remove(&prototype_key).ok_or_else(|| {
             ClassError::MalformedDefinition("missing Class prototype".to_string())
         })?;
+
         if !body.is_empty() {
             return Err(ClassError::MalformedDefinition(
                 "unknown Class body field".to_string(),
@@ -135,14 +140,22 @@ impl TryFrom<Scalar> for ClassBody {
         }
 
         let parent = match parent {
-            Scalar::Value(tc_value::Value::Link(link)) => link.to_string(),
-            Scalar::Value(tc_value::Value::String(parent)) => parent,
+            Scalar::Value(value) => match value {
+                tc_value::Value::Link(link) => link.to_string(),
+                tc_value::Value::String(parent) => parent,
+                _ => {
+                    return Err(ClassError::InvalidParent(
+                        "a Class parent must be a canonical URI".to_string(),
+                    ))
+                }
+            },
             _ => {
                 return Err(ClassError::InvalidParent(
                     "a Class parent must be a canonical URI".to_string(),
-                ));
+                ))
             }
         };
+
         let parent = decode_parent(&parent).map_err(ClassError::InvalidParent)?;
         let Scalar::Map(prototype) = prototype else {
             return Err(ClassError::MalformedDefinition(
@@ -225,121 +238,126 @@ pub fn validate_classes(
 ) -> Result<(), ClassError> {
     type Members = std::collections::BTreeMap<Id, bool>;
 
-    fn validate(
-        identity: &Link,
-        classes: &std::collections::BTreeMap<Link, ClassDef>,
-        visiting: &mut std::collections::BTreeSet<Link>,
-        memo: &mut std::collections::BTreeMap<Link, Members>,
-        depth: usize,
-    ) -> Result<Members, ClassError> {
-        if let Some(members) = memo.get(identity) {
-            return Ok(members.clone());
-        }
-        if depth >= MAX_INHERITANCE_DEPTH {
-            return Err(ClassError::InheritanceDepthExceeded {
-                limit: MAX_INHERITANCE_DEPTH,
-            });
-        }
-        if !visiting.insert(identity.clone()) {
-            return Err(ClassError::InheritanceCycle);
-        }
-        let class = classes
-            .get(identity)
-            .ok_or_else(|| ClassError::InvalidParent(identity.to_string()))?;
-        class.validate_digest()?;
-        let mut members = match class.parent() {
-            ClassParent::Class(parent) => validate(parent, classes, visiting, memo, depth + 1)?,
-            ClassParent::Native(_) => Default::default(),
-        };
-        for (member, value) in class.prototype() {
-            let method = matches!(value, Scalar::Op(_));
-            if members.get(member).is_some_and(|parent| *parent != method) {
-                return Err(ClassError::UnsupportedOverride {
-                    member: member.clone(),
+    let mut memo = std::collections::BTreeMap::<Link, Members>::new();
+    for identity in roots {
+        let mut identity = &identity;
+        let mut visiting = std::collections::BTreeSet::new();
+        let mut frames = Vec::new();
+        let mut members = loop {
+            if let Some(members) = memo.get(identity) {
+                break members.clone();
+            }
+
+            if frames.len() >= MAX_INHERITANCE_DEPTH {
+                return Err(ClassError::InheritanceDepthExceeded {
+                    limit: MAX_INHERITANCE_DEPTH,
                 });
             }
-            members.insert(member.clone(), method);
+
+            if !visiting.insert(identity) {
+                return Err(ClassError::InheritanceCycle);
+            }
+
+            let class = classes
+                .get(identity)
+                .ok_or_else(|| ClassError::InvalidParent(identity.to_string()))?;
+
+            class.validate_digest()?;
+            frames.push((identity, class));
+            match class.parent() {
+                ClassParent::Class(parent) => identity = parent,
+                ClassParent::Native(_) => break Members::new(),
+            }
+        };
+
+        while let Some((identity, class)) = frames.pop() {
+            for (member, value) in class.prototype() {
+                let method = matches!(&value, Scalar::Op(_));
+                if members.get(member).is_some_and(|parent| *parent != method) {
+                    return Err(ClassError::UnsupportedOverride {
+                        member: member.clone(),
+                    });
+                }
+
+                members.insert(member.clone(), method);
+            }
+
+            memo.insert(identity.clone(), members.clone());
         }
-        visiting.remove(identity);
-        memo.insert(identity.clone(), members.clone());
-        Ok(members)
     }
 
-    let mut memo = std::collections::BTreeMap::new();
-    for identity in roots {
-        validate(
-            &identity,
-            classes,
-            &mut std::collections::BTreeSet::new(),
-            &mut memo,
-            0,
-        )?;
-    }
     Ok(())
 }
 
 impl de::FromStream for ClassDef {
     type Context = ();
 
-    async fn from_stream<D: de::Decoder>(
-        _context: Self::Context,
+    async fn from_stream<D: de::Decoder>((): (), decoder: &mut D) -> Result<Self, D::Error> {
+        Self::decode_with_depth(decoder, tc_ir::MAX_SCALAR_DEPTH).await
+    }
+}
+
+impl ClassDef {
+    pub(crate) fn within_depth(&self, remaining: usize) -> bool {
+        remaining
+            .checked_sub(1)
+            .is_some_and(|n| self.prototype.values().all(|value| value.within_depth(n)))
+    }
+
+    pub(crate) async fn decode_with_depth<D: de::Decoder>(
         decoder: &mut D,
+        remaining: usize,
     ) -> Result<Self, D::Error> {
-        struct ClassVisitor;
+        let mut map = decoder.open_container(de::Kind::Map, None).await?;
+        let mut identity = None;
+        let mut digest = None;
+        let mut parent = None;
+        let mut prototype = None;
+        while map.slot() != de::Slot::End {
+            let key = String::from_stream((), decoder).await?;
+            decoder.finish_child(&mut map).await?;
+            match key.as_str() {
+                "identity" => identity = Some(String::from_stream((), decoder).await?),
+                "digest" => digest = Some(String::from_stream((), decoder).await?),
+                "parent" => parent = Some(String::from_stream((), decoder).await?),
+                "prototype" => {
+                    // Keep Class decoder construction small in recursive State decoding.
+                    let Scalar::Map(values) =
+                        Box::pin(tc_ir::decode_scalar(decoder, remaining)).await?
+                    else {
+                        return Err(de::Error::custom("expected Class prototype map"));
+                    };
 
-        impl de::Visitor for ClassVisitor {
-            type Value = ClassDef;
-
-            fn expecting() -> &'static str {
-                "a canonical Class definition"
-            }
-
-            async fn visit_map<A: de::MapAccess>(
-                self,
-                mut map: A,
-            ) -> Result<Self::Value, A::Error> {
-                let mut identity = None;
-                let mut digest: Option<String> = None;
-                let mut parent = None;
-                let mut prototype = None;
-
-                while let Some(key) = map.next_key::<String>(()).await? {
-                    match key.as_str() {
-                        "identity" => identity = Some(map.next_value(()).await?),
-                        "digest" => digest = Some(map.next_value(()).await?),
-                        "parent" => parent = Some(map.next_value::<String>(()).await?),
-                        "prototype" => prototype = Some(map.next_value(()).await?),
-                        _ => {
-                            return Err(de::Error::custom(format!(
-                                "unknown Class definition field {key}"
-                            )));
-                        }
-                    }
+                    prototype = Some(values);
                 }
-
-                let identity: String =
-                    identity.ok_or_else(|| de::Error::custom("missing identity"))?;
-                let identity = identity.parse::<Link>().map_err(de::Error::custom)?;
-
-                let parent =
-                    decode_parent(&parent.ok_or_else(|| de::Error::custom("missing parent"))?)
-                        .map_err(de::Error::custom)?;
-
-                let class = ClassDef {
-                    identity,
-                    digest: decode_digest(
-                        &digest.ok_or_else(|| de::Error::custom("missing digest"))?,
-                    )
-                    .map_err(de::Error::custom)?,
-                    parent,
-                    prototype: prototype.ok_or_else(|| de::Error::custom("missing prototype"))?,
-                };
-                class.validate_digest().map_err(de::Error::custom)?;
-                Ok(class)
+                _ => {
+                    return Err(de::Error::custom(format!(
+                        "unknown Class definition field {key}"
+                    )))
+                }
             }
+
+            decoder.finish_child(&mut map).await?;
         }
 
-        decoder.decode_map(ClassVisitor).await
+        let identity = identity
+            .ok_or_else(|| de::Error::custom("missing identity"))?
+            .parse::<Link>()
+            .map_err(de::Error::custom)?;
+
+        let parent = decode_parent(&parent.ok_or_else(|| de::Error::custom("missing parent"))?)
+            .map_err(de::Error::custom)?;
+
+        let class = Self {
+            identity,
+            digest: decode_digest(&digest.ok_or_else(|| de::Error::custom("missing digest"))?)
+                .map_err(de::Error::custom)?,
+            parent,
+            prototype: prototype.ok_or_else(|| de::Error::custom("missing prototype"))?,
+        };
+
+        class.validate_digest().map_err(de::Error::custom)?;
+        Ok(class)
     }
 }
 
@@ -347,7 +365,7 @@ impl<'en> en::IntoStream<'en> for ClassDef {
     fn into_stream<E: en::Encoder<'en>>(self, encoder: E) -> Result<E::Ok, E::Error> {
         let parent = encode_parent(&self.parent);
         let mut map = encoder.encode_map(Some(4))?;
-        map.encode_entry("identity", self.identity.to_string())?;
+        map.encode_entry("identity", self.identity)?;
         map.encode_entry("digest", hex::encode(self.digest))?;
         map.encode_entry("parent", parent)?;
         map.encode_entry("prototype", self.prototype)?;
@@ -388,10 +406,12 @@ impl de::FromStream for ClassBody {
                         }
                     }
                 }
+
                 let parent = decode_parent(
                     &parent.ok_or_else(|| de::Error::custom("missing Class parent"))?,
                 )
                 .map_err(de::Error::custom)?;
+
                 Ok(ClassBody::new(
                     parent,
                     prototype.ok_or_else(|| de::Error::custom("missing Class prototype"))?,
@@ -415,13 +435,21 @@ impl<'en> en::IntoStream<'en> for ClassBody {
 
 impl<'en> en::ToStream<'en> for ClassBody {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        let mut map = encoder.encode_map(Some(2))?;
+        map.encode_entry("parent", encode_parent(&self.parent))?;
+        map.encode_entry("prototype", &self.prototype)?;
+        map.end()
     }
 }
 
 impl<'en> en::ToStream<'en> for ClassDef {
     fn to_stream<E: en::Encoder<'en>>(&'en self, encoder: E) -> Result<E::Ok, E::Error> {
-        self.clone().into_stream(encoder)
+        let mut map = encoder.encode_map(Some(4))?;
+        map.encode_entry("identity", &self.identity)?;
+        map.encode_entry("digest", hex::encode(self.digest))?;
+        map.encode_entry("parent", encode_parent(&self.parent))?;
+        map.encode_entry("prototype", &self.prototype)?;
+        map.end()
     }
 }
 
@@ -436,9 +464,11 @@ fn decode_parent(value: &str) -> Result<ClassParent, String> {
     let path = value
         .parse::<PathBuf>()
         .map_err(|err| format!("invalid native Class parent: {err}"))?;
+
     if let Some(parent) = StateType::from_path(path.as_ref()) {
         return Ok(ClassParent::Native(parent));
     }
+
     value
         .parse::<Link>()
         .map(ClassParent::Class)
@@ -462,6 +492,7 @@ impl From<ClassBody> for Scalar {
                 .expect("native Class paths are valid links"),
             ClassParent::Class(parent) => parent,
         };
+
         if body.prototype.is_empty() {
             Scalar::from(tc_value::Value::Link(parent))
         } else {
@@ -677,12 +708,13 @@ impl ClassDef {
             if depth == limit {
                 return Err(ClassError::InheritanceDepthExceeded { limit });
             }
+
             if !visited.insert(class.identity.clone()) {
                 return Err(ClassError::InheritanceCycle);
             }
 
             for (member, value) in &class.prototype {
-                let method = matches!(value, Scalar::Op(_));
+                let method = matches!(&value, Scalar::Op(_));
                 if let Some(child_method) = inherited.get(member) {
                     if *child_method != method {
                         return Err(ClassError::UnsupportedOverride {
@@ -713,13 +745,13 @@ fn bind<'a, Txn: tc_collection::StorageContext>(
     declared_by: &'a Link,
     value: &'a Scalar,
 ) -> ResolvedMember<'a, Txn> {
-    match value {
+    match &value {
         Scalar::Op(definition) => ResolvedMember::BoundMethod {
             declared_by,
             definition,
             instance,
         },
-        value => ResolvedMember::Scalar {
+        _ => ResolvedMember::Scalar {
             source: MemberSource::Prototype,
             value,
         },
@@ -727,365 +759,5 @@ fn bind<'a, Txn: tc_collection::StorageContext>(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeMap;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    use bytes::Bytes;
-    use futures::{stream, TryStreamExt};
-    use tc_value::Value;
-
-    use super::*;
-
-    type TestState = State<crate::runtime::tests::TestTxn>;
-
-    fn id(value: &str) -> Id {
-        value.parse().expect("Id")
-    }
-
-    fn scalar(value: u64) -> Scalar {
-        Scalar::from(Value::from(value))
-    }
-
-    fn class_link(name: &str) -> Link {
-        format!("/class/example-devco/{name}/1.0.0")
-            .parse()
-            .expect("Class identity")
-    }
-
-    fn class(name: &str, parent: ClassParent, members: &[(&str, Scalar)]) -> ClassDef {
-        let prototype = members
-            .iter()
-            .cloned()
-            .map(|(name, value)| (id(name), value))
-            .collect();
-        ClassDef::from_body(class_link(name), ClassBody::new(parent, prototype))
-    }
-
-    fn instance(
-        class: ClassDef,
-        members: &[(&str, TestState)],
-    ) -> ClassInstance<crate::runtime::tests::TestTxn> {
-        let members = members
-            .iter()
-            .cloned()
-            .map(|(name, value)| (id(name), value))
-            .collect();
-        ClassInstance::new(TestState::None, class, members)
-    }
-
-    #[test]
-    fn instance_then_prototype_then_parent_then_native() {
-        let base = class(
-            "base",
-            ClassParent::Native(StateType::Tuple),
-            &[("base", scalar(2)), ("overridden", scalar(3))],
-        );
-        let derived = class(
-            "derived",
-            ClassParent::Class(class_link("base")),
-            &[("prototype", scalar(4)), ("overridden", scalar(5))],
-        );
-        let instance = instance(
-            derived,
-            &[
-                ("instance", TestState::from(6_u64)),
-                ("overridden", TestState::from(7_u64)),
-            ],
-        );
-        let classes = BTreeMap::from([(class_link("base"), base)]);
-
-        assert_eq!(
-            instance
-                .resolve_member(&id("instance"), &classes, |_, _, _| None)
-                .expect("instance member")
-                .source(),
-            MemberSource::Instance
-        );
-        assert_eq!(
-            instance
-                .resolve_member(&id("prototype"), &classes, |_, _, _| None)
-                .expect("prototype member")
-                .source(),
-            MemberSource::Prototype
-        );
-        assert_eq!(
-            instance
-                .resolve_member(&id("base"), &classes, |_, _, _| None)
-                .expect("inherited member")
-                .source(),
-            MemberSource::Prototype
-        );
-        assert_eq!(
-            instance
-                .resolve_member(&id("overridden"), &classes, |_, _, _| None)
-                .expect("override")
-                .source(),
-            MemberSource::Instance
-        );
-
-        let native_value = TestState::from(8_u64);
-        let resolved = instance
-            .resolve_member(&id("native"), &classes, |parent, _, _| {
-                assert_eq!(parent, Some(&StateType::Tuple));
-                Some(&native_value)
-            })
-            .expect("native member");
-        assert_eq!(resolved.source(), MemberSource::Native);
-    }
-
-    #[test]
-    fn prototype_method_is_bound_to_exact_instance() {
-        let method = tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())]);
-        let class = class(
-            "class",
-            ClassParent::Native(StateType::Tuple),
-            &[("call", Scalar::Op(method))],
-        );
-        let instance = instance(class, &[]);
-        let classes = BTreeMap::new();
-        let resolved = instance
-            .resolve_member(&id("call"), &classes, |_, _, _| None)
-            .expect("bound method");
-
-        let ResolvedMember::BoundMethod {
-            declared_by,
-            instance: bound,
-            ..
-        } = resolved
-        else {
-            panic!("expected bound method");
-        };
-        assert_eq!(declared_by, instance.class().identity());
-        assert!(std::ptr::eq(bound, &instance));
-    }
-
-    #[test]
-    fn inherited_method_reports_its_declaring_class() {
-        let parent = class(
-            "parent",
-            ClassParent::Native(StateType::Tuple),
-            &[(
-                "call",
-                Scalar::Op(tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())])),
-            )],
-        );
-        let child = class("child", ClassParent::Class(parent.identity().clone()), &[]);
-        let instance = instance(child, &[]);
-        let classes = BTreeMap::from([(parent.identity().clone(), parent.clone())]);
-        let ResolvedMember::BoundMethod { declared_by, .. } = instance
-            .resolve_member(&id("call"), &classes, |_, _, _| None)
-            .expect("inherited method")
-        else {
-            panic!("expected bound method");
-        };
-        assert_eq!(declared_by, parent.identity());
-    }
-
-    #[test]
-    fn invalid_parent_cycle_depth_and_missing_member_are_typed() {
-        let derived = class("derived", ClassParent::Class(class_link("missing")), &[]);
-        let invalid_instance = instance(derived, &[]);
-        assert!(matches!(
-            invalid_instance.resolve_member(&id("x"), &BTreeMap::new(), |_, _, _| None),
-            Err(ClassError::InvalidParent(_))
-        ));
-
-        let a = class("a", ClassParent::Class(class_link("b")), &[]);
-        let b = class("b", ClassParent::Class(class_link("a")), &[]);
-        let cycle_instance = instance(a.clone(), &[]);
-        let classes = BTreeMap::from([(class_link("a"), a), (class_link("b"), b)]);
-        assert!(matches!(
-            cycle_instance.resolve_member(&id("x"), &classes, |_, _, _| None),
-            Err(ClassError::InheritanceCycle)
-        ));
-
-        let base = class("base", ClassParent::Native(StateType::Tuple), &[]);
-        let middle = class("middle", ClassParent::Class(class_link("base")), &[]);
-        let top = class("top", ClassParent::Class(class_link("middle")), &[]);
-        let depth_instance = instance(top, &[]);
-        let classes = BTreeMap::from([(class_link("base"), base), (class_link("middle"), middle)]);
-        assert!(matches!(
-            depth_instance.resolve_member_with_limit(&id("x"), &classes, |_, _, _| None, 2),
-            Err(ClassError::InheritanceDepthExceeded { limit: 2 })
-        ));
-
-        let base = class("base", ClassParent::Native(StateType::Tuple), &[]);
-        let instance = instance(base, &[]);
-        assert!(matches!(
-            instance.resolve_member(&id("x"), &BTreeMap::new(), |_, _, _| None),
-            Err(ClassError::MissingMember { member }) if member == id("x")
-        ));
-    }
-
-    #[test]
-    fn lookup_does_not_project_parent() {
-        let first = class(
-            "stable",
-            ClassParent::Native(StateType::Tuple),
-            &[("x", scalar(1))],
-        );
-        let instance = instance(first, &[]);
-        let native_calls = AtomicUsize::new(0);
-        instance
-            .resolve_member(&id("x"), &BTreeMap::new(), |_, _, _| {
-                native_calls.fetch_add(1, Ordering::SeqCst);
-                None
-            })
-            .expect("prototype member");
-        assert_eq!(native_calls.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn validation_accepts_same_kind_override_and_rejects_kind_change() {
-        let base = class(
-            "base",
-            ClassParent::Native(StateType::Tuple),
-            &[("x", scalar(1))],
-        );
-        let classes = BTreeMap::from([(class_link("base"), base)]);
-        class(
-            "valid",
-            ClassParent::Class(class_link("base")),
-            &[("x", scalar(2))],
-        )
-        .validate(&classes)
-        .expect("same-kind override");
-
-        let invalid = class(
-            "invalid",
-            ClassParent::Class(class_link("base")),
-            &[(
-                "x",
-                Scalar::Op(tc_ir::OpDef::Post(vec![(id("result"), Scalar::default())])),
-            )],
-        );
-        assert!(matches!(
-            invalid.validate(&classes),
-            Err(ClassError::UnsupportedOverride { member }) if member == id("x")
-        ));
-    }
-
-    #[test]
-    fn batch_validation_accepts_inherited_prototypes() {
-        let base_id: Link = "/class/example-devco/base/1.0.0"
-            .parse()
-            .expect("base identity");
-        let derived_id: Link = "/class/example-devco/derived/1.0.0"
-            .parse()
-            .expect("derived identity");
-        let base = ClassDef::from_body(
-            base_id.clone(),
-            ClassBody::new(
-                ClassParent::Native(StateType::Tuple),
-                [(id("value"), scalar(1))].into_iter().collect(),
-            ),
-        );
-        let derived = ClassDef::from_body(
-            derived_id.clone(),
-            ClassBody::new(ClassParent::Class(base_id.clone()), Map::new()),
-        );
-        let classes = [(base_id, base), (derived_id.clone(), derived)]
-            .into_iter()
-            .collect();
-        validate_classes(&classes, [derived_id]).expect("valid inherited prototype");
-    }
-
-    #[tokio::test]
-    async fn validated_class_codec_is_symmetric_and_digest_checked() {
-        let identity: Link = "/class/example-devco/vector/1.0.0"
-            .parse()
-            .expect("identity");
-        let parent = ClassParent::Native(StateType::Tuple);
-        let prototype: Map<Scalar> = [(id("dimensions"), scalar(3))].into_iter().collect();
-        let body = ClassBody::new(parent, prototype);
-        let definition = ClassDef::from_body(identity, body);
-        let encoded = destream_json::encode(definition.clone()).expect("encode");
-        let decoded: ClassDef = destream_json::try_decode((), encoded)
-            .await
-            .expect("decode");
-        assert_eq!(decoded, definition);
-        assert!(decoded.validate_digest().is_ok());
-
-        let invalid = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
-            br#"{"manifest_version":2,"identity":"/class/example-devco/vector/1.0.0","digest":["sha256","4c24b66b4b5a80be4e96597c5b70d653dc223fbe2d505b9c865f10c8f14c6e91"],"parent":"/state/tuple","prototype":{}}"#,
-        ))]);
-        assert!(destream_json::try_decode::<_, _, ClassDef>((), invalid)
-            .await
-            .is_err());
-
-        let mismatched = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
-            br#"{"identity":"/class/example-devco/vector/1.0.0","digest":"0000000000000000000000000000000000000000000000000000000000000000","parent":"/state/scalar/tuple","prototype":{"dimensions":3}}"#,
-        ))]);
-        assert!(destream_json::try_decode::<_, _, ClassDef>((), mismatched)
-            .await
-            .is_err());
-    }
-
-    #[test]
-    fn class_hash_composes_its_link_and_bare_body() {
-        let body = ClassBody::new(
-            ClassParent::Native(StateType::Tuple),
-            [(id("dimensions"), scalar(3))].into_iter().collect(),
-        );
-        let first = ClassDef::from_body(
-            "/class/example-devco/vector/1.0.0".parse().unwrap(),
-            body.clone(),
-        );
-        let same = ClassDef::from_body(first.identity().clone(), body.clone());
-        let other = ClassDef::from_body("/class/example-devco/vector/2.0.0".parse().unwrap(), body);
-        assert_eq!(
-            AsyncHash::<async_hash::Sha256>::hash(&first),
-            AsyncHash::<async_hash::Sha256>::hash(&same)
-        );
-        assert_ne!(
-            AsyncHash::<async_hash::Sha256>::hash(&first),
-            AsyncHash::<async_hash::Sha256>::hash(&other)
-        );
-    }
-
-    #[test]
-    fn class_scalar_uses_the_v1_parent_or_post_form() {
-        let parent: Link = "/class/example-devco/base/1.0.0".parse().unwrap();
-        let empty: Scalar = ClassBody::new(ClassParent::Class(parent.clone()), Map::new()).into();
-        assert_eq!(empty, Scalar::from(tc_value::Value::Link(parent.clone())));
-
-        let prototype: Map<Scalar> = [(id("dimensions"), scalar(3))].into_iter().collect();
-        let populated: Scalar =
-            ClassBody::new(ClassParent::Class(parent.clone()), prototype.clone()).into();
-        assert_eq!(
-            populated,
-            Scalar::from(tc_ir::TCRef::Op(tc_ir::OpRef::Post((
-                tc_ir::Subject::Link(parent),
-                prototype,
-            ))))
-        );
-    }
-
-    #[tokio::test]
-    async fn bare_class_body_fixture_is_symmetric_and_rejects_metadata() {
-        let valid = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(include_bytes!(
-            "../../fixtures/class_definition.json"
-        )))]);
-        let definition: ClassBody = destream_json::try_decode((), valid)
-            .await
-            .expect("Class fixture");
-        let encoded = destream_json::encode(definition).expect("encode");
-        let bytes = encoded
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect")
-            .concat();
-        assert_eq!(
-            String::from_utf8(bytes).expect("utf8"),
-            include_str!("../../fixtures/class_definition.json").trim_end()
-        );
-
-        let invalid = stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(include_bytes!(
-            "../../fixtures/class_definition_invalid.json"
-        )))]);
-        assert!(destream_json::try_decode::<_, _, ClassBody>((), invalid)
-            .await
-            .is_err());
-    }
-}
+#[path = "../tests/unit/class.rs"]
+mod tests;

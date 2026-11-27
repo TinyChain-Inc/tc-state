@@ -23,3 +23,5 @@ destream_json = { path = "../deps/destream_json" }
 freqfs = { path = "../deps/freqfs", version = "0.13" }
 tokio = { version = "1", features = ["rt-multi-thread", "time", "sync", "fs", "macros"] }
 umask = "2.1"
+
+tbon = { path = "../deps/tbon" }

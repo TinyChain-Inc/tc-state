@@ -1,4 +1,5 @@
 use pathlink::{label, path_label, Label, PathBuf, PathLabel, PathSegment};
+
 pub use tc_collection::CollectionType;
 use tc_value::class::{Class, NativeClass};
 use tc_value::ValueType;
@@ -93,38 +94,5 @@ fn path_matches(path: &[PathSegment], expected: &PathLabel) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tuple_path_is_canonical_scalar_tuple() {
-        let path = StateType::Tuple.path().to_string();
-        assert_eq!(path, "/state/scalar/tuple");
-    }
-
-    #[test]
-    fn accepts_canonical_tuple_path() {
-        let canonical = "/state/scalar/tuple"
-            .parse::<PathBuf>()
-            .expect("canonical tuple path");
-
-        assert_eq!(
-            StateType::from_path(canonical.as_ref()),
-            Some(StateType::Tuple)
-        );
-    }
-
-    #[test]
-    fn accepts_canonical_btree_collection_path() {
-        let canonical = "/state/collection/btree"
-            .parse::<PathBuf>()
-            .expect("canonical btree path");
-
-        assert_eq!(
-            StateType::from_path(canonical.as_ref()),
-            Some(StateType::Collection(CollectionType::BTree(
-                tc_collection::BTreeType,
-            )))
-        );
-    }
-}
+#[path = "../../tests/unit/codec/class.rs"]
+mod tests;
